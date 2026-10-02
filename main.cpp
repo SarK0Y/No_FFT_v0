@@ -1,125 +1,146 @@
-#define DR_WAV_IMPLEMENTATION
-#include "third_party/dr_wav.h"
+#include "nofft.h"
 
-#include <stdint.h>
-#include <stddef.h>
 #include <stdio.h>
-#include <string.h>
 #include <stdlib.h>
+#include <string.h>
 
-enum Err {
-    ERR_OK = 0,
-    ERR_IO,
-    ERR_OPEN,
-    ERR_NOT_WAV,
-    ERR_UNSUPPORTED_FMT,
-    ERR_NO_MEMORY,
-    ERR_COUNT
-};
-
-typedef const char* (*err_str_fn)(Err);
-
-static const char* err_str_impl(Err e)
+static void usage(const char* argv0)
 {
-    switch (e) {
-    case ERR_OK:              return "ok";
-    case ERR_IO:              return "i/o error";
-    case ERR_OPEN:            return "cannot open";
-    case ERR_NOT_WAV:         return "not a wav file";
-    case ERR_UNSUPPORTED_FMT: return "unsupported sample format";
-    case ERR_NO_MEMORY:       return "out of memory";
-    default:                  return "unknown error";
-    }
+    fprintf(stderr,
+        "usage:\n"
+        "  %s encode <in.wav> <out.no.fft> [frame_len] [degree]\n"
+        "  %s decode <in.no.fft> <out.wav>\n"
+        "  %s roundtrip <in.wav> [frame_len] [degree]\n",
+        argv0, argv0, argv0);
 }
 
-static err_str_fn g_err_str = err_str_impl;
-
-typedef struct {
-    uint32_t sample_rate;
-    uint16_t channels;
-    uint16_t bits_per_sample;
-    uint16_t format_tag;
-    uint64_t frames;
-} wav_info;
-
-/* First 4 bytes of every container dr_wav understands. Mirrors the magic
-   checks in drwav_init_file_ex() so we never reject a file it could read. */
-static int wav_is_container(const unsigned char* magic)
+static uint32_t parse_u32(const char* s, uint32_t dflt)
 {
-    static const char* const known[] = { "RIFF", "RIFX", "riff", "RF64", "FORM" };
+    char* end = NULL;
+    unsigned long v;
 
-    for (size_t i = 0; i < sizeof(known) / sizeof(known[0]); ++i) {
-        if (memcmp(magic, known[i], 4) == 0)
-            return 1;
-    }
-    return 0;
-}
+    if (s == NULL || *s == '\0')
+        return dflt;
 
-static Err wav_probe(const char* path, wav_info* out)
-{
-    drwav wav;
-    unsigned char magic[4];
-    FILE* f;
+    v = strtoul(s, &end, 10);
+    if (end == s || *end != '\0' || v == 0 || v > 0xFFFFFFFFul)
+        return dflt;
 
-    memset(out, 0, sizeof(*out));
-
-    /* Open first: distinguishes "cannot reach the file" from "file is not audio". */
-    f = fopen(path, "rb");
-    if (f == nullptr)
-        return ERR_OPEN;
-
-    if (fread(magic, 1, sizeof(magic), f) != sizeof(magic)) {
-        fclose(f);
-        return ERR_NOT_WAV;
-    }
-    fclose(f);
-
-    if (!wav_is_container(magic))
-        return ERR_NOT_WAV;
-
-    if (!drwav_init_file(&wav, path, nullptr))
-        return ERR_NOT_WAV;
-
-    switch (wav.translatedFormatTag) {
-    case DR_WAVE_FORMAT_PCM:
-    case DR_WAVE_FORMAT_IEEE_FLOAT:
-    case DR_WAVE_FORMAT_ALAW:
-    case DR_WAVE_FORMAT_MULAW:
-        break;
-    default:
-        drwav_uninit(&wav);
-        return ERR_UNSUPPORTED_FMT;
-    }
-
-    out->sample_rate     = wav.sampleRate;
-    out->channels        = wav.channels;
-    out->bits_per_sample = wav.bitsPerSample;
-    out->format_tag      = wav.translatedFormatTag;
-    out->frames          = wav.totalPCMFrameCount;
-
-    drwav_uninit(&wav);
-    return ERR_OK;
+    return (uint32_t)v;
 }
 
 int main(int argc, char** argv)
 {
-    drwav_uint32 major = 0, minor = 0, rev = 0;
-    drwav_version(&major, &minor, &rev);
-    printf("dr_wav %u.%u.%u  |  ERR_COUNT=%d\n", major, minor, rev, (int)ERR_COUNT);
+    uint32_t frame_len;
+    uint32_t degree;
+    pcm_buf pcm, dec;
+    Err e;
 
-    for (int i = 1; i < argc; ++i) {
-        wav_info info;
-        Err e = wav_probe(argv[i], &info);
 
+
+    if (argc < 2) {
+        usage(argv[0]);
+        return 2;
+    }
+
+    if (strcmp(argv[1], "encode") == 0) {
+        if (argc < 4) {
+            usage(argv[0]);
+            return 2;
+        }
+        frame_len = parse_u32(argc > 4 ? argv[4] : NULL, 20);
+        degree = parse_u32(argc > 5 ? argv[5] : NULL, 3);
+
+        e = wav_load(argv[2], &pcm);
         if (e != ERR_OK) {
-            printf("%-24s %s\n", argv[i], g_err_str(e));
-            continue;
+            fprintf(stderr, "%s: %s\n", argv[2], g_err_str(e));
+            return 1;
         }
 
-        printf("%-24s %u ch  %u Hz  %2u bit  tag=0x%04X  %llu frames  %.3f s\n",
-               argv[i], info.channels, info.sample_rate, info.bits_per_sample,
-               info.format_tag, (unsigned long long)info.frames,
-               info.sample_rate ? (double)info.frames / info.sample_rate : 0.0);
+        e = nofft_encode(argv[3], &pcm, frame_len, (uint16_t)degree);
+        if (e != ERR_OK) {
+            fprintf(stderr, "%s: %s\n", argv[3], g_err_str(e));
+            pcm_free(&pcm);
+            return 1;
+        }
+
+        printf("%s -> %s  %u ch  %u Hz  frame_len=%u degree=%u  %zu samples\n",
+               argv[2], argv[3], pcm.channels, pcm.sample_rate,
+               frame_len, degree, pcm.count);
+
+        pcm_free(&pcm);
+        return 0;
     }
-    return 0;
+
+    if (strcmp(argv[1], "decode") == 0) {
+        if (argc < 4) {
+            usage(argv[0]);
+            return 2;
+        }
+
+        e = nofft_decode(argv[2], &dec);
+        if (e != ERR_OK) {
+            fprintf(stderr, "%s: %s\n", argv[2], g_err_str(e));
+            return 1;
+        }
+
+        e = wav_save(argv[3], &dec);
+        if (e != ERR_OK) {
+            fprintf(stderr, "%s: %s\n", argv[3], g_err_str(e));
+            pcm_free(&dec);
+            return 1;
+        }
+
+        printf("%s -> %s  %u ch  %u Hz  %zu samples\n",
+               argv[2], argv[3], dec.channels, dec.sample_rate, dec.count);
+
+        pcm_free(&dec);
+        return 0;
+    }
+
+    if (strcmp(argv[1], "roundtrip") == 0) {
+        size_t n;
+        float snr;
+
+        if (argc < 2) {
+            usage(argv[0]);
+            return 2;
+        }
+
+        frame_len = parse_u32(argc > 3 ? argv[3] : NULL, 20);
+        degree = parse_u32(argc > 4 ? argv[4] : NULL, 3);
+
+        e = wav_load(argv[2], &pcm);
+        if (e != ERR_OK) {
+            fprintf(stderr, "%s: %s\n", argv[2], g_err_str(e));
+            return 1;
+        }
+
+        e = nofft_encode("/tmp/opencode/rt.no.fft", &pcm, frame_len, (uint16_t)degree);
+        if (e != ERR_OK) {
+            fprintf(stderr, "encode: %s\n", g_err_str(e));
+            pcm_free(&pcm);
+            return 1;
+        }
+
+        e = nofft_decode("/tmp/opencode/rt.no.fft", &dec);
+        if (e != ERR_OK) {
+            fprintf(stderr, "decode: %s\n", g_err_str(e));
+            pcm_free(&pcm);
+            return 1;
+        }
+
+        n = (pcm.count < dec.count) ? pcm.count : dec.count;
+        snr = nofft_decode_snr_db(pcm.samples, dec.samples, n);
+
+        printf("frame_len=%-5u degree=%-3u  in=%zu out=%zu  SNR=%.2f dB\n",
+               frame_len, degree, pcm.count, dec.count, (double)snr);
+
+        pcm_free(&pcm);
+        pcm_free(&dec);
+        return 0;
+    }
+
+    usage(argv[0]);
+    return 2;
 }
