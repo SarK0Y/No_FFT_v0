@@ -8,6 +8,9 @@
 #include <stdlib.h>
 #include <math.h>
 
+typedef char nofft_magic_size_check[(sizeof(NOFFT_MAGIC) == 5) ? 1 : -1];
+typedef char nofft_header_size_check[(NOFFT_HEADER_SIZE >= 28) ? 1 : -1];
+
 static const char* err_str_impl(Err e)
 {
     switch (e) {
@@ -95,7 +98,8 @@ Err wav_load(const char* path, pcm_buf* out)
     }
 
     {
-        uint64_t total = wav.totalPCMFrameCount * wav.channels;
+        uint32_t ch = wav.channels;
+        uint64_t total = wav.totalPCMFrameCount * (uint64_t)ch;
         size_t done = 0;
 
         if (total == 0 || total > (uint64_t)((SIZE_MAX / sizeof(float)) - 1)) {
@@ -109,25 +113,26 @@ Err wav_load(const char* path, pcm_buf* out)
             return ERR_NO_MEMORY;
         }
 
+        out->sample_rate = wav.sampleRate;
+        out->channels = ch;
+
         while (done < (size_t)total) {
-            size_t want = (size_t)total - done;
+            uint64_t want = ((uint64_t)total - (uint64_t)done) / (uint64_t)ch;
             size_t got;
 
             if (want > 4096)
                 want = 4096;
 
-            got = g_pcm_read(&wav, (uint64_t)want, out->samples + done);
+            got = g_pcm_read(&wav, want, out->samples + done);
             if (got == 0)
                 break;
 
-            done += got;
+            done += got * (size_t)ch;
         }
 
         drwav_uninit(&wav);
 
         out->count = done;
-        out->sample_rate = wav.sampleRate;
-        out->channels = wav.channels;
         return ERR_OK;
     }
 }
@@ -156,9 +161,13 @@ Err wav_save(const char* path, const pcm_buf* p)
     if (!drwav_init_file_write(&wav, path, &fmt, nullptr))
         return ERR_OPEN;
 
-    if (drwav_write_pcm_frames(&wav, (drwav_uint64)p->count, p->samples) != (drwav_uint64)p->count) {
-        drwav_uninit(&wav);
-        return ERR_IO;
+    {
+        uint64_t frames = (uint64_t)p->count / (uint64_t)p->channels;
+
+        if (drwav_write_pcm_frames(&wav, frames, p->samples) != frames) {
+            drwav_uninit(&wav);
+            return ERR_IO;
+        }
     }
 
     drwav_uninit(&wav);
@@ -174,7 +183,7 @@ uint16_t nofft_effective_degree(uint16_t degree, uint32_t len)
     return degree;
 }
 
-double nofft_subrange_mean(const float* s, size_t n)
+double nofft_subrange_mean(const float* s, size_t n, size_t stride)
 {
     double acc = 0.0;
     size_t i;
@@ -183,12 +192,12 @@ double nofft_subrange_mean(const float* s, size_t n)
         return 0.0;
 
     for (i = 0; i < n; ++i)
-        acc += (double)s[i];
+        acc += (double)s[i * stride];
 
     return acc / (double)n;
 }
 
-void nofft_subrange_pick(const float* s, size_t n, double mean, uint32_t* out_index, double* out_value)
+void nofft_subrange_pick(const float* s, size_t n, size_t stride, double mean, uint32_t* out_index, double* out_value)
 {
     size_t i;
     size_t best = 0;
@@ -203,7 +212,7 @@ void nofft_subrange_pick(const float* s, size_t n, double mean, uint32_t* out_in
     best_d = fabs((double)s[0] - mean);
 
     for (i = 1; i < n; ++i) {
-        double d = fabs((double)s[i] - mean);
+        double d = fabs((double)s[i * stride] - mean);
         if (d < best_d) {
             best_d = d;
             best = i;
@@ -211,7 +220,7 @@ void nofft_subrange_pick(const float* s, size_t n, double mean, uint32_t* out_in
     }
 
     *out_index = (uint32_t)best;
-    *out_value = (double)s[best];
+    *out_value = (double)s[best * stride];
 }
 
 Err nofft_solve_vandermonde(const double* xs, const double* ys, int n, double* out_coefs)
@@ -285,7 +294,7 @@ double nofft_eval_poly(const double* c, int n, double x)
     return v;
 }
 
-static void frame_constraints(const float* s, uint32_t len, uint16_t d, double* xs, double* ys)
+static void frame_constraints(const float* s, size_t stride, uint32_t len, uint16_t d, double* xs, double* ys)
 {
     uint32_t nsub = (uint32_t)d + 1;
     uint32_t i;
@@ -302,13 +311,13 @@ static void frame_constraints(const float* s, uint32_t len, uint16_t d, double* 
         if (end <= start)
             end = (start < len) ? start + 1 : len;
 
-        mean = nofft_subrange_mean(s + start, (size_t)(end - start));
-        nofft_subrange_pick(s + start, (size_t)(end - start), mean, &pick, &val);
+        mean = nofft_subrange_mean(s + start * stride, (size_t)(end - start), stride);
+        nofft_subrange_pick(s + start * stride, (size_t)(end - start), stride, mean, &pick, &val);
 
         pos = start + pick;
 
         xs[i] = (len > 1) ? (2.0 * (double)pos / (double)(len - 1) - 1.0) : 0.0;
-        ys[i] = (double)s[pos];
+        ys[i] = (double)s[pos * stride];
     }
 }
 
@@ -316,19 +325,30 @@ Err nofft_encode(const char* path, const pcm_buf* p, uint32_t frame_len, uint16_
 {
     FILE* f;
     uint64_t total_frames;
+    uint32_t n_frames, last_len;
     uint64_t fi;
-    uint8_t hdr[28];
+    uint8_t hdr[NOFFT_HEADER_SIZE];
     uint16_t ch = p->channels;
 
     if (p->samples == NULL || ch == 0 || frame_len == 0 || degree == 0)
         return ERR_BAD_ARGS;
 
     total_frames = (uint64_t)(p->count / ch);
+    if (total_frames == 0)
+        return ERR_BAD_ARGS;
+
+    n_frames = (uint32_t)((total_frames + frame_len - 1) / frame_len);
+    last_len = (uint32_t)(total_frames - (uint64_t)(n_frames - 1) * frame_len);
+
+    if (nofft_effective_degree(degree, frame_len) > 63 ||
+        nofft_effective_degree(degree, last_len) > 63)
+        return ERR_BAD_ARGS;
 
     f = fopen(path, "wb");
     if (f == NULL)
         return ERR_OPEN;
 
+    memset(hdr, 0, sizeof(hdr));
     memcpy(hdr, NOFFT_MAGIC, 4);
     {
         uint32_t v = NOFFT_VERSION;
@@ -337,6 +357,8 @@ Err nofft_encode(const char* path, const pcm_buf* p, uint32_t frame_len, uint16_
         memcpy(hdr + 12, &ch, 2);
         memcpy(hdr + 14, &degree, 2);
         memcpy(hdr + 16, &frame_len, 4);
+        memcpy(hdr + 20, &n_frames, 4);
+        memcpy(hdr + 24, &last_len, 4);
     }
     if (fwrite(hdr, 1, sizeof(hdr), f) != sizeof(hdr)) {
         fclose(f);
@@ -349,25 +371,13 @@ Err nofft_encode(const char* path, const pcm_buf* p, uint32_t frame_len, uint16_
         uint16_t d = nofft_effective_degree(degree, len);
         int n = (int)d + 1;
         double xs[64], ys[64], coefs[64];
-        uint32_t c16;
-        uint8_t flen[4];
-        uint32_t written = 0;
         uint16_t ci;
-
-        if (n > 64)
-            n = 64;
-
-        memcpy(&flen, &len, 4);
-        if (fwrite(flen, 1, 4, f) != 4) {
-            fclose(f);
-            return ERR_IO;
-        }
 
         for (ci = 0; ci < ch; ++ci) {
             Err e;
             int j;
 
-            frame_constraints(p->samples + (fi * ch) + ci, len, d, xs, ys);
+            frame_constraints(p->samples + (fi * ch) + ci, ch, len, d, xs, ys);
             e = nofft_solve_vandermonde(xs, ys, n, coefs);
             if (e != ERR_OK) {
                 fclose(f);
@@ -380,12 +390,8 @@ Err nofft_encode(const char* path, const pcm_buf* p, uint32_t frame_len, uint16_
                     fclose(f);
                     return ERR_IO;
                 }
-                written += 4;
             }
         }
-
-        (void)written;
-        (void)c16;
     }
 
     fclose(f);
@@ -395,14 +401,14 @@ Err nofft_encode(const char* path, const pcm_buf* p, uint32_t frame_len, uint16_
 Err nofft_decode(const char* path, pcm_buf* out)
 {
     FILE* f;
-    uint8_t hdr[28];
-    uint32_t frame_len;
+    uint8_t hdr[NOFFT_HEADER_SIZE];
+    uint32_t version, sr, frame_len, n_frames, last_len;
     uint16_t degree, ch;
-    uint32_t sr;
-    uint64_t done_frames = 0;
-    size_t cap, used = 0;
+    uint64_t total_frames, total_samples;
+    uint32_t fi;
     float* buf;
-    uint8_t chunk[4];
+    double* coefs;
+    size_t used = 0;
 
     memset(out, 0, sizeof(*out));
 
@@ -419,61 +425,49 @@ Err nofft_decode(const char* path, pcm_buf* out)
         return ERR_BAD_NOFFT;
     }
 
+    memcpy(&version, hdr + 4, 4);
     memcpy(&sr, hdr + 8, 4);
     memcpy(&ch, hdr + 12, 2);
     memcpy(&degree, hdr + 14, 2);
     memcpy(&frame_len, hdr + 16, 4);
+    memcpy(&n_frames, hdr + 20, 4);
+    memcpy(&last_len, hdr + 24, 4);
 
-    if (ch == 0 || frame_len == 0 || degree == 0) {
+    if (version != NOFFT_VERSION || ch == 0 || degree == 0 ||
+        frame_len == 0 || n_frames == 0 || last_len == 0 || last_len > frame_len ||
+        nofft_effective_degree(degree, frame_len) > 63 ||
+        nofft_effective_degree(degree, last_len) > 63) {
         fclose(f);
         return ERR_BAD_NOFFT;
     }
 
-    cap = 1024 * (size_t)frame_len * ch;
-    buf = (float*)malloc(cap * sizeof(float));
+    total_frames = (uint64_t)(n_frames - 1) * frame_len + last_len;
+    total_samples = total_frames * ch;
+
+    if (total_samples > (uint64_t)((SIZE_MAX / sizeof(float)) - 1)) {
+        fclose(f);
+        return ERR_NO_MEMORY;
+    }
+
+    buf = (float*)malloc((size_t)total_samples * sizeof(float));
     if (buf == NULL) {
         fclose(f);
         return ERR_NO_MEMORY;
     }
 
-    for (;;) {
-        uint32_t len;
-        uint16_t d;
-        int n, i;
+    coefs = (double*)malloc(sizeof(double) * (size_t)(nofft_effective_degree(degree, frame_len) + 1) * ch);
+    if (coefs == NULL) {
+        free(buf);
+        fclose(f);
+        return ERR_NO_MEMORY;
+    }
+
+    for (fi = 0; fi < n_frames; ++fi) {
+        uint32_t len = (fi == n_frames - 1) ? last_len : frame_len;
+        uint16_t d = nofft_effective_degree(degree, len);
+        int n = (int)d + 1;
+        int i;
         uint16_t ci;
-        double* coefs;
-
-        if (fread(chunk, 1, 4, f) != 4)
-            break;
-
-        memcpy(&len, chunk, 4);
-        if (len == 0 || len > frame_len) {
-            free(buf);
-            fclose(f);
-            return ERR_BAD_NOFFT;
-        }
-
-        d = nofft_effective_degree(degree, len);
-        n = (int)d + 1;
-
-        if (used + (size_t)len * ch > cap) {
-            size_t ncap = cap * 2 + (size_t)len * ch;
-            float* nb = (float*)realloc(buf, ncap * sizeof(float));
-            if (nb == NULL) {
-                free(buf);
-                fclose(f);
-                return ERR_NO_MEMORY;
-            }
-            buf = nb;
-            cap = ncap;
-        }
-
-        coefs = (double*)malloc(sizeof(double) * (size_t)n * ch);
-        if (coefs == NULL) {
-            free(buf);
-            fclose(f);
-            return ERR_NO_MEMORY;
-        }
 
         for (ci = 0; ci < ch; ++ci) {
             for (i = 0; i < n; ++i) {
@@ -489,7 +483,7 @@ Err nofft_decode(const char* path, pcm_buf* out)
         }
 
         for (ci = 0; ci < ch; ++ci) {
-            size_t k;
+            uint32_t k;
 
             for (k = 0; k < len; ++k) {
                 double t = (len > 1) ? (2.0 * (double)k / (double)(len - 1) - 1.0) : 0.0;
@@ -499,17 +493,15 @@ Err nofft_decode(const char* path, pcm_buf* out)
         }
 
         used += (size_t)len * ch;
-        done_frames += len;
-        free(coefs);
     }
 
+    free(coefs);
     fclose(f);
 
     out->samples = buf;
     out->count = used;
     out->sample_rate = sr;
     out->channels = ch;
-    (void)done_frames;
     return ERR_OK;
 }
 
