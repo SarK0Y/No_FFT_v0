@@ -9,7 +9,115 @@
 #include <math.h>
 
 typedef char nofft_magic_size_check[(sizeof(NOFFT_MAGIC) == 5) ? 1 : -1];
-typedef char nofft_header_size_check[(NOFFT_HEADER_SIZE >= 28) ? 1 : -1];
+typedef char nofft_header_size_check[(NOFFT_HEADER_SIZE >= 29) ? 1 : -1];
+
+static uint16_t f32_to_f16_bits(float f)
+{
+    uint32_t x;
+    uint32_t sign, mant;
+    int32_t e;
+
+    memcpy(&x, &f, 4);
+    sign = (x >> 16) & 0x8000u;
+    e = (int32_t)((x >> 23) & 0xFFu);
+
+    if (e == 0xFF) {
+        if ((x & 0x007FFFFFu) != 0u)
+            return (uint16_t)(sign | 0x7E00u); /* NaN */
+        return (uint16_t)(sign | 0x7C00u);     /* Inf */
+    }
+
+    e = e - 127 + 15;
+    mant = x & 0x007FFFFFu;
+
+    if (e >= 31)
+        return (uint16_t)(sign | 0x7BFFu);     /* saturate, not Inf */
+    if (e > 0) {
+        uint32_t m = mant >> 13;
+        uint32_t half = 1u << 12;
+        if ((mant & half) != 0u) {
+            uint32_t lower = mant & (half - 1u);
+            if (lower != 0u || (m & 1u) != 0u) {
+                m += 1u;
+                if (m == 0x400u) {
+                    m = 0u;
+                    e += 1;
+                    if (e >= 31)
+                        return (uint16_t)(sign | 0x7BFFu);
+                }
+            }
+        }
+        return (uint16_t)(sign | ((uint32_t)e << 10) | m);
+    }
+
+    if (e < -10)
+        return (uint16_t)sign;                /* underflow to signed zero */
+
+    mant |= 0x00800000u;
+    {
+        int32_t shift = 14 - e;
+        uint32_t m = mant >> shift;
+        uint32_t half = 1u << (shift - 1);
+        if ((mant & half) != 0u) {
+            uint32_t lower = mant & (half - 1u);
+            if (lower != 0u || (m & 1u) != 0u)
+                m += 1u;
+        }
+        return (uint16_t)(sign | m);
+    }
+}
+
+static float f16_bits_to_f32(uint16_t h)
+{
+    uint32_t sign = (uint32_t)(h & 0x8000u) << 16;
+    uint32_t e = (uint32_t)(h >> 10) & 0x1Fu;
+    uint32_t mant = (uint32_t)(h & 0x03FFu);
+    uint32_t out;
+    float f;
+
+    if (e == 0u) {
+        if (mant == 0u) {
+            out = sign;
+        } else {
+            int32_t k = 0;
+            while ((mant & 0x400u) == 0u) {
+                mant <<= 1;
+                k += 1;
+            }
+            mant &= 0x03FFu;
+            out = sign | ((uint32_t)(113 - k) << 23) | (mant << 13);
+        }
+    } else if (e == 31u) {
+        out = sign | 0x7F800000u | (mant << 13);
+    } else {
+        out = sign | ((uint32_t)(e + 112u) << 23) | (mant << 13);
+    }
+
+    memcpy(&f, &out, 4);
+    return f;
+}
+
+const char* nofft_coeff_format_str(nofft_coeff_format cf)
+{
+    return (cf == NOFFT_COEF_F16) ? "f16" : "f32";
+}
+
+int nofft_coeff_format_parse(const char* s, nofft_coeff_format* out)
+{
+    if (s == NULL)
+        return 0;
+    if (strcmp(s, "f16") == 0 || strcmp(s, "f16le") == 0 ||
+        strcmp(s, "float16") == 0 || strcmp(s, "half") == 0) {
+        *out = NOFFT_COEF_F16;
+        return 1;
+    }
+    if (strcmp(s, "f32") == 0 || strcmp(s, "f32le") == 0 ||
+        strcmp(s, "float32") == 0 || strcmp(s, "float") == 0) {
+        *out = NOFFT_COEF_F32;
+        return 1;
+    }
+    return 0;
+}
 
 static const char* err_str_impl(Err e)
 {
@@ -22,6 +130,7 @@ static const char* err_str_impl(Err e)
     case ERR_NO_MEMORY:       return "out of memory";
     case ERR_BAD_NOFFT:       return "corrupt no_fft file";
     case ERR_BAD_ARGS:        return "bad arguments";
+    case ERR_RANGE:           return "coefficient out of range for the requested format (try f32)";
     default:                  return "unknown error";
     }
 }
@@ -321,8 +430,68 @@ static void frame_constraints(const float* s, size_t stride, uint32_t len, uint1
     }
 }
 
-Err nofft_encode(const char* path, const pcm_buf* p, uint32_t frame_len, uint16_t degree)
+static void put_u32le(uint8_t* d, uint32_t v)
 {
+    d[0] = (uint8_t)(v & 0xFF);
+    d[1] = (uint8_t)((v >> 8) & 0xFF);
+    d[2] = (uint8_t)((v >> 16) & 0xFF);
+    d[3] = (uint8_t)((v >> 24) & 0xFF);
+}
+
+static void put_u16le(uint8_t* d, uint16_t v)
+{
+    d[0] = (uint8_t)(v & 0xFF);
+    d[1] = (uint8_t)((v >> 8) & 0xFF);
+}
+
+Err wav_write_stream(FILE* out, const pcm_buf* p)
+{
+    uint8_t hdr[44];
+    uint64_t data_bytes;
+    uint16_t ch;
+    uint32_t block_align;
+
+    if (out == NULL || p->samples == NULL || p->channels == 0 || p->sample_rate == 0)
+        return ERR_BAD_ARGS;
+
+    ch = p->channels;
+    block_align = (uint32_t)ch * 4u;
+    data_bytes = (uint64_t)p->count * 4u;
+
+    if (data_bytes + 36u > 0xFFFFFFFFull)
+        return ERR_BAD_ARGS;
+
+    memcpy(hdr + 0, "RIFF", 4);
+    put_u32le(hdr + 4, (uint32_t)(data_bytes + 36u));
+    memcpy(hdr + 8, "WAVE", 4);
+    memcpy(hdr + 12, "fmt ", 4);
+    put_u32le(hdr + 16, 16);
+    put_u16le(hdr + 20, 3);
+    put_u16le(hdr + 22, ch);
+    put_u32le(hdr + 24, p->sample_rate);
+    put_u32le(hdr + 28, p->sample_rate * block_align);
+    put_u16le(hdr + 32, (uint16_t)block_align);
+    put_u16le(hdr + 34, 32);
+    memcpy(hdr + 36, "data", 4);
+    put_u32le(hdr + 40, (uint32_t)data_bytes);
+
+    if (fwrite(hdr, 1, sizeof(hdr), out) != sizeof(hdr))
+        return ERR_IO;
+
+    if (p->count > 0 &&
+        fwrite(p->samples, 4, p->count, out) != p->count)
+        return ERR_IO;
+
+    if (fflush(out) != 0)
+        return ERR_IO;
+
+    return ERR_OK;
+}
+
+Err nofft_encode(const char* path, const pcm_buf* p, uint32_t frame_len, uint16_t degree,
+                 nofft_coeff_format cf)
+{
+    double f32_sig = 0.0, f32_err = 0.0, f16_sig = 0.0, f16_err = 0.0;
     FILE* f;
     uint64_t total_frames;
     uint32_t n_frames, last_len;
@@ -331,6 +500,8 @@ Err nofft_encode(const char* path, const pcm_buf* p, uint32_t frame_len, uint16_
     uint16_t ch = p->channels;
 
     if (p->samples == NULL || ch == 0 || frame_len == 0 || degree == 0)
+        return ERR_BAD_ARGS;
+    if (cf != NOFFT_COEF_F32 && cf != NOFFT_COEF_F16)
         return ERR_BAD_ARGS;
 
     total_frames = (uint64_t)(p->count / ch);
@@ -359,6 +530,10 @@ Err nofft_encode(const char* path, const pcm_buf* p, uint32_t frame_len, uint16_
         memcpy(hdr + 16, &frame_len, 4);
         memcpy(hdr + 20, &n_frames, 4);
         memcpy(hdr + 24, &last_len, 4);
+        {
+            uint8_t cfv = (uint8_t)cf;
+            memcpy(hdr + 28, &cfv, 1);
+        }
     }
     if (fwrite(hdr, 1, sizeof(hdr), f) != sizeof(hdr)) {
         fclose(f);
@@ -370,7 +545,7 @@ Err nofft_encode(const char* path, const pcm_buf* p, uint32_t frame_len, uint16_
                                   ? (total_frames - fi) : frame_len);
         uint16_t d = nofft_effective_degree(degree, len);
         int n = (int)d + 1;
-        double xs[64], ys[64], coefs[64];
+        double xs[64], ys[64], coefs[64], rounded[64];
         uint16_t ci;
 
         for (ci = 0; ci < ch; ++ci) {
@@ -384,17 +559,78 @@ Err nofft_encode(const char* path, const pcm_buf* p, uint32_t frame_len, uint16_
                 return e;
             }
 
-            for (j = 0; j < n; ++j) {
-                float v = (float)coefs[j];
-                if (fwrite(&v, 1, sizeof(v), f) != sizeof(v)) {
+            if (cf == NOFFT_COEF_F16) {
+                uint8_t tmp[128];
+                if ((size_t)n * 2u > sizeof(tmp)) {
+                    fclose(f);
+                    return ERR_RANGE;
+                }
+                for (j = 0; j < n; ++j) {
+                    double c = coefs[j];
+                    uint16_t h;
+                    if (c > 65504.0 || c < -65504.0) {
+                        fclose(f);
+                        return ERR_RANGE;
+                    }
+                    h = f32_to_f16_bits((float)c);
+                    tmp[j * 2 + 0] = (uint8_t)(h & 0xFFu);
+                    tmp[j * 2 + 1] = (uint8_t)((h >> 8) & 0xFFu);
+                }
+                for (j = 0; j < n; ++j) {
+                    uint16_t h = (uint16_t)((uint16_t)tmp[j * 2] |
+                                            ((uint16_t)tmp[j * 2 + 1] << 8));
+                    rounded[j] = (double)f16_bits_to_f32(h);
+                }
+                if (fwrite(tmp, 1, (size_t)n * 2u, f) != (size_t)n * 2u) {
                     fclose(f);
                     return ERR_IO;
+                }
+            } else {
+                uint8_t tmp[256];
+                if ((size_t)n * 4u > sizeof(tmp)) {
+                    fclose(f);
+                    return ERR_RANGE;
+                }
+                for (j = 0; j < n; ++j) {
+                    float v = (float)coefs[j];
+                    memcpy(tmp + j * 4, &v, 4);
+                    rounded[j] = (double)v;
+                }
+                if (fwrite(tmp, 1, (size_t)n * 4u, f) != (size_t)n * 4u) {
+                    fclose(f);
+                    return ERR_IO;
+                }
+            }
+
+            {
+                uint32_t k;
+                for (k = 0; k < len; ++k) {
+                    double t = (len > 1) ? (2.0 * (double)k / (double)(len - 1) - 1.0) : 0.0;
+                    double orig = (double)p->samples[(size_t)(fi + k) * ch + ci];
+                    double a = nofft_eval_poly(coefs, n, t) - orig;
+                    double b = nofft_eval_poly(rounded, n, t) - orig;
+                    f32_sig += orig * orig;
+                    f16_sig += orig * orig;
+                    f32_err += a * a;
+                    f16_err += b * b;
                 }
             }
         }
     }
 
     fclose(f);
+
+    if (cf == NOFFT_COEF_F16 && f16_sig > 0.0) {
+        double s32 = (f32_err > 0.0) ? 10.0 * log10(f32_sig / f32_err) : 1.0e9;
+        double s16 = (f16_err > 0.0) ? 10.0 * log10(f16_sig / f16_err) : 1.0e9;
+        if (s16 < s32 - 6.0)
+            fprintf(stderr,
+                    "nofft: warning: f16 coefficients reconstruct at %.1f dB "
+                    "SNR here (f32 would give %.1f dB); prefer f32 for this "
+                    "degree\n",
+                    s16, s32);
+    }
+
     return ERR_OK;
 }
 
@@ -404,6 +640,7 @@ Err nofft_decode(const char* path, pcm_buf* out)
     uint8_t hdr[NOFFT_HEADER_SIZE];
     uint32_t version, sr, frame_len, n_frames, last_len;
     uint16_t degree, ch;
+    nofft_coeff_format cf = NOFFT_COEF_F32;
     uint64_t total_frames, total_samples;
     uint32_t fi;
     float* buf;
@@ -433,7 +670,20 @@ Err nofft_decode(const char* path, pcm_buf* out)
     memcpy(&n_frames, hdr + 20, 4);
     memcpy(&last_len, hdr + 24, 4);
 
-    if (version != NOFFT_VERSION || ch == 0 || degree == 0 ||
+    if (version == NOFFT_VERSION) {
+        uint8_t cfv;
+        memcpy(&cfv, hdr + 28, 1);
+        if (cfv > (uint8_t)NOFFT_COEF_F16) {
+            fclose(f);
+            return ERR_BAD_NOFFT;
+        }
+        cf = (nofft_coeff_format)cfv;
+    } else if (version != 2) {
+        fclose(f);
+        return ERR_BAD_NOFFT;
+    }
+
+    if (ch == 0 || degree == 0 ||
         frame_len == 0 || n_frames == 0 || last_len == 0 || last_len > frame_len ||
         nofft_effective_degree(degree, frame_len) > 63 ||
         nofft_effective_degree(degree, last_len) > 63) {
@@ -470,15 +720,30 @@ Err nofft_decode(const char* path, pcm_buf* out)
         uint16_t ci;
 
         for (ci = 0; ci < ch; ++ci) {
-            for (i = 0; i < n; ++i) {
-                float v;
-                if (fread(&v, 1, sizeof(v), f) != sizeof(v)) {
-                    free(coefs);
-                    free(buf);
-                    fclose(f);
-                    return ERR_BAD_NOFFT;
+            if (cf == NOFFT_COEF_F16) {
+                for (i = 0; i < n; ++i) {
+                    uint8_t raw[2];
+                    uint16_t h;
+                    if (fread(raw, 1, 2, f) != 2) {
+                        free(coefs);
+                        free(buf);
+                        fclose(f);
+                        return ERR_BAD_NOFFT;
+                    }
+                    h = (uint16_t)((uint16_t)raw[0] | ((uint16_t)raw[1] << 8));
+                    coefs[(size_t)ci * n + i] = (double)f16_bits_to_f32(h);
                 }
-                coefs[(size_t)ci * n + i] = (double)v;
+            } else {
+                for (i = 0; i < n; ++i) {
+                    float v;
+                    if (fread(&v, 1, sizeof(v), f) != sizeof(v)) {
+                        free(coefs);
+                        free(buf);
+                        fclose(f);
+                        return ERR_BAD_NOFFT;
+                    }
+                    coefs[(size_t)ci * n + i] = (double)v;
+                }
             }
         }
 
