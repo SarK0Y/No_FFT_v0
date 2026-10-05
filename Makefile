@@ -1,4 +1,5 @@
 # no_fft - lossy WAV -> .no_fft variable-degree polynomial codec
+#          also acpcm: sample-domain DPCM with a range coder (.nadc)
 #
 #   make            build the host (linux) codec
 #   make deb        build a installable .deb package
@@ -21,8 +22,8 @@ WIN_CXX      ?= x86_64-w64-mingw32-g++
 WIN_CXXFLAGS ?= -std=c++17 -O2 -Wall -Wextra -Werror -pedantic
 WIN_LDLIBS   ?= -lm
 
-SRC := main.cpp nofft.cpp
-HDR := nofft.h third_party/dr_wav.h
+SRC := main.cpp nofft.cpp acpcm.cpp selftest.cpp
+HDR := nofft.h acpcm.h selftest.h third_party/dr_wav.h
 
 OUT_DIR_LINUX := codecs/linux/ubuntu
 OUT_DIR_WIN   := codecs/windows/10
@@ -65,6 +66,10 @@ clean:
 	rm -f $(OUT_DIR_LINUX)/nofft $(OUT_DIR_WIN)/nofft.exe gmon.out
 
 # fail if debian/control, debian/changelog and the man page disagree on the version
+# self contained checks: no input files needed
+test: linux
+	./codecs/linux/ubuntu/nofft selftest
+
 checkver:
 	@v=$$(sed -n 's/^Version:[ \t]*//p' debian/control); \
 	c=$$(sed -n 's/^nofft (\([^)]*\)).*/\1/p' debian/changelog | head -1); \

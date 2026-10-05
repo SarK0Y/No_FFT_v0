@@ -19,11 +19,13 @@ make            # host build -> codecs/linux/ubuntu/nofft
 make deb        # Debian package -> build/nofft_<version>_amd64.deb
 make windows    # cross-build win64 (needs mingw-w64)
 make checkver   # assert control/changelog/man agree on the version
+make test       # built-in checks, no input files needed
 make clean
 ```
 
-Only `main.cpp`, `nofft.cpp`, `nofft.h` and the vendored `third_party/dr_wav.h`
-are compiled. There are no other dependencies.
+Only `main.cpp`, `nofft.cpp`, `acpcm.cpp`, `selftest.cpp`, the two headers and
+the vendored `third_party/dr_wav.h` are compiled. There are no other
+dependencies.
 
 ## Install
 
@@ -36,10 +38,18 @@ Or skip the package and just run the binary from `codecs/linux/ubuntu/`.
 ## Use
 
 ```
-nofft encode   <in.wav>    <out.no.fft> [frame_len] [degree] [f32|f16]
+nofft encode   <in.wav>    <out.no.fft> [frame_len] [degree] [f32|f16] [interp|least-sq]
 nofft decode   <in.no.fft> <out.wav>
-nofft roundtrip <in.wav>              [frame_len] [degree] [f32|f16]
+nofft roundtrip <in.wav>              [frame_len] [degree] [f32|f16] [interp|least-sq]
+nofft convert  <in.mp3> <out.no.fft>  [frame_len] [degree] [f32|f16] [interp|least-sq]
 nofft play     <in.no.fft>
+
+nofft ac-encode   <in.wav> <out.nadc> [bits]
+nofft ac-decode   <in.nadc> <out.wav>
+nofft ac-roundtrip <in.wav>            [bits]
+nofft ac-info     <in.nadc>
+nofft ac-play     <in.nadc>
+nofft selftest
 ```
 
 `roundtrip` is the thing to reach for while tuning: it encodes, decodes, and
@@ -48,9 +58,46 @@ prints the resulting SNR without touching the disk.
 ```sh
 nofft roundtrip song.wav 20 4        # defaults: frame_len 20, degree 3, f32
 nofft encode song.wav song.no_fft 20 4 f16
+nofft convert song.mp3 song.no_fft 20 4 f16
 nofft play song.no_fft | mpv -
 ```
 
+### From MP3
+
+`convert` takes anything `ffmpeg` can read, MP3 included, decodes it to float32
+WAV in a temporary file, and encodes that:
+
+```sh
+nofft convert song.mp3 song.no_fft 20 4 f16
+```
+
+The intermediate WAV is removed on every path, including failures. Filenames go
+straight to `ffmpeg` via `execvp`, never through a shell, so spaces and shell
+metacharacters in names are safe.
+
+### What MP3 cannot be represented by
+
+Read this before trusting converted output. The codec suits smooth, tonal
+material, and MP3 is not that. Measured SNR through a full decode at
+`frame_len=20 degree=6 f32`:
+
+| Input | SNR |
+| --- | --- |
+| 440 Hz sine | 72.83 dB |
+| four-tone mix (440/1319/3111/7000 Hz) | -2.66 dB |
+| pink noise | -4.38 dB |
+
+Negative SNR means the reconstruction is noisier than the original, which is
+what Runge divergence looks like when a polynomial is asked to follow content it
+cannot. Sweeping pink noise across settings does not rescue it: wherever real
+compression happens, at ratios above roughly 1.2:1, the SNR is negative.
+Fidelity and compression only coexist once the degree is high enough that the
+file is no smaller than the PCM, at which point there is no reason to use this
+codec.
+
+So `convert` handles MP3 mechanically and correctly, but this is not a viable
+MP3 transcoder for real music. It suits synthetic or strongly tonal material.
+Check `nofft roundtrip` on your material before converting a whole library.
 ### Playing it
 
 `nofft play` writes a canonical 44-byte-header RIFF/WAVE stream of IEEE float32
@@ -74,6 +121,7 @@ open `.no_fft` natively would mean shipping an FFmpeg/libavcodec decoder.
 | `frame_len` | Frames per block. The dominant size control: bigger blocks mean fewer polynomials. |
 | `degree` | Coefficients per block. More coefficients means a better fit at a larger cost. |
 | `f32` / `f16` | 4 or 2 bytes per coefficient. `f16` halves the file. |
+| `interp` / `least-sq` | How the polynomial is fitted. `least-sq` fits every sample in the block; `interp` interpolates picked samples. Default `interp`. |
 
 Effective degree is clamped to `frame_len - 1`, and refused above 63 (the solver
 holds at most 64 coefficients). Blocks are all `frame_len` except the last, which
@@ -112,7 +160,7 @@ rather than saturated.
 
 ## How it works
 
-For each block of `frame_len` frames, independently per channel:
+For each block of `frame_len` frames, independently per channel, with `interp`:
 
 1. Split the block into `degree + 1` sub-ranges.
 2. For each sub-range, take its mean and keep the single sample nearest to it.
@@ -124,11 +172,54 @@ For each block of `frame_len` frames, independently per channel:
 
 Decoding is a Horner evaluation of that polynomial at each frame position.
 
-Two consequences worth knowing:
+### `least-sq`
 
-- **The fit is not a least-squares fit.** It interpolates chosen samples
-  exactly and ignores the rest, which is why it stays square and cheap but also
-  why high degrees can behave badly.
+`interp` interpolates a handful of picked samples exactly and ignores the rest.
+That keeps the system square and cheap, but it also means a block whose unpicked
+samples are wild gets fitted through a couple of outliers and ignores everything
+else. `least-sq` uses every sample in the block as one equation and minimises the
+sum of squared error instead:
+
+1. Map each frame position to `x` in `[-1, 1]`, the same grid the decoder uses.
+2. Build one row of `A` per sample, with `A[k][j] = x_k^j`.
+3. Solve the over-determined system `min ||Ax - y||` by Householder QR.
+4. Store the coefficients.
+
+The solver is QR, not the normal equations. `A'A` squares the condition number of
+this Vandermonde, which is already large: by around degree 20 the normal equations
+return visibly wrong answers while QR stays accurate to about `1e-14` relative
+even at degree 63. There is no basis change, so the stored coefficients remain
+plain monomials and the decoder is unchanged.
+
+Cost is one QR per block instead of one `O(degree^3)` solve, and the encoder
+allocates two `frame_len`-sized scratch buffers, so `least-sq` is the slower path.
+That is a CPU/quality trade, not a size trade: for the same `frame_len`, `degree`
+and coefficient format, both fits produce byte-identical file sizes.
+
+Because a least-squares fit has enough equations, it does not overshoot the way
+interpolation does. Reconstruction error drops at every setting measured:
+
+| Source (44.1 kHz, from MP3) | `frame_len` | `degree` | `interp` | `least-sq` |
+| --- | --- | --- | --- | --- |
+| sine | 20 | 6 | 72.84 dB | 81.09 dB |
+| harmonic stack | 20 | 6 | 82.29 dB | 89.34 dB |
+| vibrato | 20 | 6 | 5.01 dB | 17.68 dB |
+| pink noise | 20 | 6 | -4.66 dB | 9.07 dB |
+| white noise | 20 | 6 | -11.33 dB | 2.08 dB |
+
+The gain is small on clean periodic material and large on anything noisy or
+amplitude-modulated, which is where `interp` was weakest. `least-sq` does not fix
+the underlying problem with this codec — it is still a per-block polynomial fit,
+and broadband material remains poorly served. It removes a failure mode rather
+than the limitation.
+
+One caveat: when `degree + 1 >= frame_len` the system is square, so `least-sq`
+and `interp` solve the same interpolation problem and agree in exact arithmetic.
+Observed differences there are f32 coefficient rounding of an ill-conditioned
+high-degree fit, not a difference in method.
+
+Two further notes on `interp`:
+
 - **The sub-range count is `degree + 1`, not `degree`.** This differs from the
   original specification for the project, which called for `degree` sub-ranges
   plus frame-start and fixed-median positions. This is a known, unresolved
@@ -143,7 +234,7 @@ length.
 | Offset | Size | Field |
 | --- | --- | --- |
 | 0 | 4 | magic `NOFF` |
-| 4 | 4 | version (3) |
+| 4 | 4 | version (6) |
 | 8 | 4 | sample rate |
 | 12 | 2 | channels |
 | 14 | 2 | degree |
@@ -151,15 +242,150 @@ length.
 | 20 | 4 | block count |
 | 24 | 4 | length of the final block |
 | 28 | 1 | coefficient format: 0 = f32, 1 = f16 |
-| 29 | 3 | padding |
+| 29 | 1 | fit: 0 = interp, 1 = least-sq |
+| 30 | 2 | padding |
 
-Version 2 files are still read, as f32. Version 1 (which carried a length per
-block) is rejected, as is any unrecognised coefficient format.
+### Per-block statistical fill (versions 5 and 6)
+
+Each block begins with one extra byte, then the coefficients:
+
+    [fill byte][channel 0 coefficients][channel 1 coefficients]...
+
+The fill byte is the block's residual RMS on a log scale over `[-140, 0] dBFS`
+(255 steps). Byte `0` means no fill and is emitted for exact fits and for digital
+silence. The decoder regenerates deterministic pseudo-random noise from the block
+index, scales it to the decoded RMS, and adds it to the polynomial, so the
+reconstruction carries the same noise character as the original block. The noise
+is derived purely from the block index, so no seed is stored and encoding is
+reproducible.
+
+This costs one byte per block: at `L=32, D=6, f16` stereo a block grows from 28 to
+29 bytes, i.e. 3.5 to 3.625 bits per sample (+3.6%).
+
+### Per-block bounds (version 6, current)
+
+Version 6 replaces the RMS byte with **two** bound bytes, so its block is
+`[min][max][coefficients]`:
+
+    [min][max][channel 0 coefficients][channel 1 coefficients]...
+
+Each bound is a signed log-magnitude byte over `[-60, 0] dBFS` with the sign in
+bit 7; `0` means exact zero. The decoder pulls any reconstructed sample that
+falls outside `[min, max]` back by a random fraction (50-100%) of its overshoot,
+repeating up to four times. This converges very close to a hard clamp while
+leaving a little random residue.
+
+At `L=32, D=6, f16` stereo a block is 30 bytes, i.e. 3.75 bits per sample
+(+7.1% over version 4). The bounds correct 1.9% of samples, and about 55% of
+blocks contain at least one such sample.
+
+**Version 6 replaced version 5 because the two are not combinable.** Bounds pull
+inward on the samples the polynomial already overshoots; an RMS fill adds energy
+everywhere. Bounds make the error slightly more tonal, the fill makes it slightly
+less tonal, and only one of the two is worth its bytes.
+
+Versions 2, 3, 4 and 5 are still read. Version 5 keeps its one RMS byte, version
+4 is the first fit-aware version and has no per-block side info; both are read
+identically apart from their leading byte.
+Version 2 predates the coefficient format byte and is read as f32; version 3
+predates the fit byte and is read as `interp`. Version 1 (which carried a length
+per block) is rejected, as is any unrecognised coefficient format or fit.
 
 **Known portability defect:** the header and f32 coefficients are written with
 host byte order, so files produced on a big-endian machine will not read on a
 little-endian one and vice versa. f16 coefficients are little-endian. Little-
 endian only, in practice.
+
+## acpcm: sample-domain DPCM with a range coder
+
+The commands above and the rest of this file describe the polynomial codec. The
+`ac-*` commands are a second, independent codec: it keeps **no polynomial at
+all**, and is usually the better choice. Files use the `.nadc` extension and the
+`NFA1` magic, so the two formats never collide and both readers stay simple.
+
+```sh
+nofft ac-roundtrip song.wav 6     # 31.1 dB at 3.10 bits per sample
+nofft ac-encode song.wav song.nadc 6
+nofft ac-decode song.nadc song.out.wav
+nofft ac-play song.nadc | mpv -
+```
+
+### How it works
+
+Each channel is coded as a first difference against the *previous reconstructed*
+sample:
+
+    xhat[n] = a1 * xhat[n-1] + q[n] * step
+
+so `q` is a small integer and the decoder only needs `a1`, `step` and the
+sequence of `q`. Three passes per channel: measure the peak and mean, fit `a1`
+by least squares and measure the largest residual, then encode.
+
+The step is derived from that residual peak, `step = 2 * residual_peak / (2^bits
+- 1)`, which puts the largest residual just inside the quantiser range. The
+symbols go through an LZMA-style carryless range coder: a zero flag, a unary
+magnitude class, the mantissa bits, then the sign, each with its own adaptive
+probability.
+
+Measured on one bass-heavy 44.1 kHz stereo track, the 47.55 s window available
+for testing:
+
+| bits | bits/sample | SNR |
+| ---- | ----------- | ------ |
+| 4    | 1.41        | 18.7 dB |
+| 5    | 2.19        | 25.0 dB |
+| 6    | 3.10        | 31.1 dB |
+| 7    | 4.06        | 37.2 dB |
+| 8    | 5.04        | 43.3 dB |
+
+Roughly 6 dB per bit, about 20 dB better than the polynomial codec at a
+comparable rate.
+
+### Format
+
+All integers little endian, independent of the host.
+
+    0   char     magic[4]   "NFA1"
+    4   uint32   frames     frames per channel
+    8   uint32   bits       quantiser width, 2..24
+    12  uint32   channels
+    16  uint32   sample_rate
+    20  uint32   len[c]     byte length of each channel chunk
+    ..  payload: the chunks, back to back
+
+Every channel is its own range-coded chunk starting with its own range-coded
+header: peak, mean, `a1`, step, and `bits`, all 16-bit fixed point except the
+width byte. A chunk is therefore not byte aligned and cannot be found by seeking;
+the length table is what makes random access possible. Range-coded streams also
+cannot be concatenated, which is why each channel is separate rather than one
+stream with interleaved channels.
+
+Two details are load-bearing. Every header field is quantised **before** it is
+written, and the encoder then codes the already-quantised value: rounding once
+more on the way out shifts the gain by one LSB, and because the filter is
+recursive the two sides never resynchronise, so the damage runs to the last
+sample. And `a1` is held at or below 0.999, since the pole of `1/(1 - a1 z^-1)`
+is `a1` and anything above 1 diverges in closed loop.
+
+### Limits worth knowing
+
+- **Input range.** The header fields are 16-bit fixed point over a nominal
+  [-1, 1] signal, so samples outside +/-2.0, or NaN, are rejected with
+  `ERR_BAD_INPUT` rather than clamped into a stream that decodes to noise.
+- **Quality saturates near 12 bits.** The step is stored in 16 bits, so past
+  about `bits=12` the quantiser is finer than the header can express: most
+  residuals round to zero and extra widths only cost rate. The rate climbs with
+  `bits` up to about 8 and then flattens and falls.
+- **Steady tones saturate early.** A pure tone's best one-step gain is
+  `2*cos(w)`, which is above 1 for anything below about 60 Hz at 48 kHz, so `a1`
+  clamps and the noise gain `1/(1 - a1)` is large. A tone gains far less than
+  6 dB per bit. Real material has broadband noise and behaves like the table.
+- **Overshoot.** Reconstruction can exceed the input peak (1.0095 at `bits=6` on
+  the test track). Output is 32-bit float, so nothing clips, but converting to
+  16-bit later will.
+- **Rates are content dependent.** Every number above comes from one bass-heavy
+  track whose energy is 78.7% below 1 kHz. Bright material will cost more.
+
 
 ## Library API
 
@@ -171,24 +397,38 @@ pcm_buf p;
 if (wav_load("song.wav", &p) != ERR_OK)
     return 1;
 
-if (nofft_encode("song.no_fft", &p, 20, 4, NOFFT_COEF_F16) != ERR_OK)
+if (nofft_encode("song.no_fft", &p, 20, 4, NOFFT_COEF_F16,
+                 NOFFT_FIT_LEAST_SQ) != ERR_OK)
     return 1;
 
 pcm_free(&p);
 ```
 
 Also exported: `wav_save`, `wav_write_stream`, `nofft_decode`,
-`nofft_decode_snr_db`, `nofft_coeff_format_str` / `_parse`, and the solver
-(`nofft_solve_vandermonde`, `nofft_eval_poly`) with its helpers.
+`nofft_decode_snr_db`, `nofft_coeff_format_str` / `_parse`,
+`nofft_fit_str` / `_parse`, `nofft_file_fit`, and the solvers
+(`nofft_solve_vandermonde`, `nofft_solve_least_squares`, `nofft_eval_poly`) with
+their helpers.
 
-The code is C++ written in a C style: no classes, no STL containers, no
-exceptions, manual allocation, `enum Err` returns. Buffers are freed with
-`pcm_free`.
+`nofft_encode` takes a `nofft_fit` as its last argument; `NOFFT_FIT_INTERP` is the
+previous behaviour.
+
+`acpcm.h` is the second codec, usable the same way: `acpcm_encode`,
+`acpcm_decode`, `acpcm_file_info` and `acpcm_info`.
+
+The polynomial codec is C++ written in a C style: no classes, no STL containers,
+no exceptions, manual allocation, `enum Err` returns. Buffers are freed with
+`pcm_free`. `acpcm.cpp` uses `std::vector` internally, which is an implementation
+detail; its public interface is the same `enum Err` style.
 
 ## Supported input
 
 WAV only, read through dr_wav: PCM, IEEE float, A-law and mu-law. Output is
 always 32-bit float WAV.
+
+The `convert` command additionally reads anything `ffmpeg` can decode, by way of
+a temporary 32-bit float WAV. `ffmpeg` is not a build or install dependency; only
+that one command needs it at runtime.
 
 ## Verification
 
@@ -198,12 +438,31 @@ within 1 ulp, and exact ties round to even. ASan, UBSan and leak detection are
 clean across degrees 0–63, frame lengths 1–200, both coefficient formats, mono /
 stereo / float input, and the corrupt-file and error paths.
 
+`make test` runs `nofft selftest`, which needs no input files: bit-exact
+reconstruction of silence, constant DC and single samples, round trips at every
+bit width from 2 to 16, a bounded-noise case, and the malformed input the
+decoder has to reject (out-of-range samples, NaN, both ends of the bit-width
+range, a truncated file, a foreign magic, and a `.nadc` offered to the
+polynomial reader). 60 random bit-flip corruptions of a real `.nadc` produce no
+sanitizer report and no crash, and truncation at every length down to 4 bytes is
+an error rather than a short buffer.
+
+`convert` is checked for shell-injection safety with filenames containing spaces
+and metacharacters, against a missing `ffmpeg`, and for temporary-file leaks
+across every success and failure path. `nofft_encode` removes its output when it
+fails part way, so a truncated file is never mistaken for a valid one. A
+converted file is byte-identical to encoding the same decoded WAV directly.
+
 ## Layout
 
 ```
-main.cpp        CLI
+main.cpp        CLI, including the ffmpeg-backed convert command
 nofft.cpp       WAV I/O, interpolation, solver, f16 conversion, container
 nofft.h         public API and format constants
+acpcm.cpp       range coder, DPCM analyser and encoder, NFA1 container
+acpcm.h         public API for the acpcm codec
+selftest.cpp    built-in checks behind `nofft selftest`
+selftest.h      self-test entry point
 Makefile        host / windows / deb targets
 debian/         packaging: control, copyright, changelog, nofft.1
 third_party/    dr_wav.h (vendored)
