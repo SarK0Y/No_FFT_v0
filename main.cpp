@@ -25,11 +25,12 @@ static void usage(const char* argv0)
         "  %s ac-play <in.nadc>               (WAV to stdout, for piping)\n"
         "  %s ac-info <in.nadc>\n"
         "  %s ac-roundtrip <in.wav> [bits]\n"
+        "  %s ac-gen <out.wav> [seconds] [ch] [rate]\n"
+        "  %s ac-play-alsa <in.nadc> [-d device]\n"
         "  %s selftest\n",
         argv0, argv0, argv0, argv0, argv0,
-        argv0, argv0, argv0, argv0, argv0, argv0);
+        argv0, argv0, argv0, argv0, argv0, argv0, argv0, argv0);
 }
-
 static uint32_t parse_u32(const char* s, uint32_t dflt)
 {
     char* end = NULL;
@@ -434,6 +435,21 @@ int main(int argc, char** argv)
         return 0;
     }
 
+    if (strcmp(argv[1], "ac-gen") == 0) {
+        if (argc < 3) {
+            usage(argv[0]);
+            return 2;
+        }
+        double secs = (argc >= 4) ? atof(argv[3]) : 0.5;
+        uint32_t ch = (argc >= 5) ? (uint32_t)atoi(argv[4]) : 2;
+        uint32_t rate = (argc >= 6) ? (uint32_t)atoi(argv[5]) : 44100;
+        Err e = acpcm_gen(argv[2], secs, ch, rate);
+        if (e != ERR_OK) {
+            fprintf(stderr, "%s: %s\n", argv[2], g_err_str(e));
+            return 1;
+        }
+        return 0;
+    }
     if (strcmp(argv[1], "ac-play") == 0) {
         if (argc < 3) {
             usage(argv[0]);
@@ -457,6 +473,23 @@ int main(int argc, char** argv)
         return 0;
     }
 
+    if (strcmp(argv[1], "ac-play-alsa") == 0 || strcmp(argv[1], "ac-play-device") == 0) {
+        if (argc < 3) {
+            usage(argv[0]);
+            return 2;
+        }
+        const char* device = NULL;
+        for (int i = 3; i < argc; i++) {
+            if (strcmp(argv[i], "-d") == 0 && i + 1 < argc)
+                device = argv[++i];
+        }
+        Err e = acpcm_play(argv[2], device);
+        if (e != ERR_OK) {
+            fprintf(stderr, "%s: %s\n", argv[2], g_err_str(e));
+            return 1;
+        }
+        return 0;
+    }
     if (strcmp(argv[1], "ac-info") == 0) {
         acpcm_info info;
 

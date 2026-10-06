@@ -15,16 +15,20 @@ lossless codecs. It is lossy by construction.
 ## Build
 
 ```sh
-make            # host build -> codecs/linux/ubuntu/nofft
+make            # host build -> codecs/linux/ubuntu/{nofft,acc}
 make deb        # Debian package -> build/nofft_<version>_amd64.deb
 make windows    # cross-build win64 (needs mingw-w64)
 make checkver   # assert control/changelog/man agree on the version
-make test       # built-in checks, no input files needed
+make test       # both self tests, no input files needed
+make check-ac   # prove the C and C++ codecs agree byte for byte
 make clean
 ```
 
+Two binaries are built. `nofft` is C++ and is the format reference. `acc` is the
+same acpcm codec in portable C11, with no dependencies beyond libc (and ALSA for
+playback, detected by `pkg-config`; without it `acc` still encodes and decodes).
 Only `main.cpp`, `nofft.cpp`, `acpcm.cpp`, `selftest.cpp`, the two headers and
-the vendored `third_party/dr_wav.h` are compiled. There are no other
+the vendored `third_party/dr_wav.h` are compiled for `nofft`; there are no other
 dependencies.
 
 ## Install
@@ -304,11 +308,28 @@ all**, and is usually the better choice. Files use the `.nadc` extension and the
 `NFA1` magic, so the two formats never collide and both readers stay simple.
 
 ```sh
-nofft ac-roundtrip song.wav 6     # 31.1 dB at 3.10 bits per sample
+nofft ac-roundtrip song.wav 6     # 30.7 dB at 3.03 bits per sample
 nofft ac-encode song.wav song.nadc 6
 nofft ac-decode song.nadc song.out.wav
 nofft ac-play song.nadc | mpv -
 ```
+
+The same verbs exist in the C build as `acc encode`, `acc decode`, `acc play`,
+`acc info`, `acc roundtrip` and `acc selftest`, and they read and write the same
+files byte for byte:
+
+```sh
+acc encode song.wav song.nadc 6
+acc play song.nadc -d null        # render without hardware
+acc info song.nadc
+acc gen test.wav 0.5 2            # deterministic signal, for testing
+```
+
+Two things are done better in C. Channels are separate range-coded streams, so
+`acc play` advances them in lockstep and interleaves them as it goes, which
+keeps memory at one block regardless of file length; the C++ `ac-decode`
+materialises a whole channel at a time. And the C build has its own WAV reader,
+so it needs no `dr_wav.h` and no `ffmpeg`.
 
 ### How it works
 
@@ -332,11 +353,13 @@ for testing:
 
 | bits | bits/sample | SNR |
 | ---- | ----------- | ------ |
-| 4    | 1.41        | 18.7 dB |
-| 5    | 2.19        | 25.0 dB |
-| 6    | 3.10        | 31.1 dB |
-| 7    | 4.06        | 37.2 dB |
-| 8    | 5.04        | 43.3 dB |
+| 4    | 1.21        | 16.8 dB |
+| 5    | 2.07        | 24.1 dB |
+| 6    | 3.03        | 30.7 dB |
+| 7    | 4.03        | 37.0 dB |
+| 8    | 5.02        | 43.1 dB |
+| 12   | 8.95        | 67.0 dB |
+| 16   | 12.27       | 87.0 dB |
 
 Roughly 6 dB per bit, about 20 dB better than the polynomial codec at a
 comparable rate.
@@ -372,15 +395,16 @@ is `a1` and anything above 1 diverges in closed loop.
 - **Input range.** The header fields are 16-bit fixed point over a nominal
   [-1, 1] signal, so samples outside +/-2.0, or NaN, are rejected with
   `ERR_BAD_INPUT` rather than clamped into a stream that decodes to noise.
-- **Quality saturates near 12 bits.** The step is stored in 16 bits, so past
-  about `bits=12` the quantiser is finer than the header can express: most
-  residuals round to zero and extra widths only cost rate. The rate climbs with
-  `bits` up to about 8 and then flattens and falls.
+- **Quality saturates near 16 bits.** The step is stored in 16 bits, so once the
+  quantiser wants to be finer than `1/32768` the header can no longer express it
+  and extra widths buy nothing: on the test track bits 16, 20 and 24 all measure
+  87.0 dB. The rate keeps climbing anyway, so there is no reason to ask for more
+  than 16.
 - **Steady tones saturate early.** A pure tone's best one-step gain is
   `2*cos(w)`, which is above 1 for anything below about 60 Hz at 48 kHz, so `a1`
   clamps and the noise gain `1/(1 - a1)` is large. A tone gains far less than
   6 dB per bit. Real material has broadband noise and behaves like the table.
-- **Overshoot.** Reconstruction can exceed the input peak (1.0095 at `bits=6` on
+- **Overshoot.** Reconstruction can exceed the input peak (1.010 at `bits=6` on
   the test track). Output is 32-bit float, so nothing clips, but converting to
   16-bit later will.
 - **Rates are content dependent.** Every number above comes from one bass-heavy
@@ -447,6 +471,18 @@ polynomial reader). 60 random bit-flip corruptions of a real `.nadc` produce no
 sanitizer report and no crash, and truncation at every length down to 4 bytes is
 an error rather than a short buffer.
 
+The C build is checked against the C++ one rather than only against itself:
+`make check-ac` generates a stereo test signal, encodes it with both tools at
+every width from 2 to 24, and requires the files to be byte identical, then
+decodes with both and requires the WAVs to be byte identical too. Both are built
+with `-Wall -Wextra -Werror -pedantic`, and the C build adds `-Wshadow
+-Wpointer-arith -Wcast-qual -Wstrict-prototypes -Wmissing-prototypes` plus
+`-ffp-contract=off`, because a fused multiply-add in the predictor would round
+differently from the C++ build and desync the recursive filter for the rest of the
+file. `acc selftest` covers exact silence, quality rising monotonically with bit
+width, symbol range at every width, stereo interleaving, and the malformed inputs
+the decoder must reject.
+
 `convert` is checked for shell-injection safety with filenames containing spaces
 and metacharacters, against a missing `ffmpeg`, and for temporary-file leaks
 across every success and failure path. `nofft_encode` removes its output when it
@@ -463,8 +499,15 @@ acpcm.cpp       range coder, DPCM analyser and encoder, NFA1 container
 acpcm.h         public API for the acpcm codec
 selftest.cpp    built-in checks behind `nofft selftest`
 selftest.h      self-test entry point
+c/ac.h          public API for the C acpcm codec
+c/main.c        `acc` CLI, including its self test
+c/acpcm.c       DPCM analysis, encoder, streaming interleaved decoder, NFA1
+c/rc.c          carryless range coder, encoder and decoder
+c/wavio.c       RIFF/WAVE reader and 32-bit float writer
+c/play.c        ALSA playback, straight from the streaming decoder
+c/Makefile      standalone C build
 Makefile        host / windows / deb targets
-debian/         packaging: control, copyright, changelog, nofft.1
+debian/         packaging: control, copyright, changelog, nofft.1, acc.1
 third_party/    dr_wav.h (vendored)
 codecs/         build output per platform
 build/          packages and staging
@@ -481,3 +524,7 @@ See `LICENSE`.
 Working, with two known issues: the host-endian serialisation defect above, and
 the sub-range discrepancy with the original specification. Neither blocks normal
 use on little-endian machines.
+
+The acpcm codec in `NFA1` is implemented twice, in C++ and in C, and `make
+check-ac` keeps the two honest by comparing them byte for byte at every bit
+width. The C++ copy remains the reference.

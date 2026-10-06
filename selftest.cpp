@@ -235,6 +235,88 @@ static void test_widths(int verbose)
     pcm_free(&in);
 }
 
+/* The step has to survive being stored in a 16 bit header field without leaving
+   the largest residual outside the symbol range.  When it did not, one clipped
+   sample left an error that decayed only as fast as 1/(1-a1) and quality became
+   erratic: bits=14 scored worse than bits=12 on real material.  A clamp free
+   stream is what monotonic quality in the width ladder rests on. */
+static void test_no_clipping(int verbose)
+{
+    const size_t frames = 20000;
+    pcm_buf in, out;
+    char det[192];
+    double prev_snr = 0.0;
+    int rising = 1;
+    int any_over = 0;
+
+    memset(&in, 0, sizeof(in));
+    memset(&out, 0, sizeof(out));
+    in.count = frames * 2;
+    in.channels = 2;
+    in.sample_rate = 44100;
+    in.samples = (float*)malloc(in.count * sizeof(float));
+    if (in.samples == NULL)
+        return;
+
+    rng_seed(0x2468u);
+    for (size_t i = 0; i < frames; i++) {
+        double t = (double)i / 44100.0;
+        in.samples[i * 2 + 0] = (float)(0.35 * sin(t * 2.0 * 3.14159265358979 * 220.0) +
+                                        0.25 * sin(t * 2.0 * 3.14159265358979 * 1500.0) +
+                                        0.25 * (double)rng_next());
+        in.samples[i * 2 + 1] = (float)(0.35 * sin(t * 2.0 * 3.14159265358979 * 180.0) +
+                                        0.25 * sin(t * 2.0 * 3.14159265358979 * 1900.0) +
+                                        0.25 * (double)rng_next());
+    }
+
+    /* quality has to climb with the width; a clipped peak makes it dip */
+    for (uint16_t bits = 4; bits <= 14; bits++) {
+        Err e = trip(&in, bits, &out);
+        if (e != ERR_OK) {
+            snprintf(det, sizeof(det), "bits=%u %s", bits, g_err_str(e));
+            check(0, verbose, "quality climbs with bit width", det);
+            pcm_free(&out);
+            memset(&out, 0, sizeof(out));
+            continue;
+        }
+        double snr = (double)nofft_decode_snr_db(in.samples, out.samples, in.count);
+        if (bits > 4 && snr <= prev_snr)
+            rising = 0;
+        prev_snr = snr;
+        pcm_free(&out);
+        memset(&out, 0, sizeof(out));
+    }
+    check(rising, verbose, "quality climbs with bit width", "");
+
+    /* Overshoot is expected, runaway is not: with a1 held under 1 a clip free
+       loop cannot diverge, so a peak far past the input means it did. */
+    for (uint16_t bits = 4; bits <= 16; bits += 2) {
+        Err e = trip(&in, bits, &out);
+        if (e != ERR_OK)
+            continue;
+        /* compare peaks: a per sample ratio is meaningless where the input
+           sample is near zero, and the quantiser legitimately nudges those */
+        double pin = 0.0, pout = 0.0;
+        for (size_t i = 0; i < in.count; i++) {
+            double av = in.samples[i] < 0 ? -(double)in.samples[i]
+                                          : (double)in.samples[i];
+            double bv = out.samples[i] < 0 ? -(double)out.samples[i]
+                                           : (double)out.samples[i];
+            if (av > pin)
+                pin = av;
+            if (bv > pout)
+                pout = bv;
+        }
+        if (pin > 0.0 && pout > 2.0 * pin)
+            any_over = 1;
+        pcm_free(&out);
+        memset(&out, 0, sizeof(out));
+    }
+    check(!any_over, verbose, "no runaway across widths", "");
+
+    pcm_free(&in);
+}
+
 /* Noise is worst case for a DPCM, so it is the cheapest way to prove the
    quantiser actually bounds the signal instead of letting it run away. */
 static void test_noise_bound(int verbose)
@@ -391,6 +473,7 @@ Err acpcm_selftest(int verbose)
     printf("acpcm selftest\n");
     test_exact(verbose);
     test_widths(verbose);
+    test_no_clipping(verbose);
     test_noise_bound(verbose);
     test_rejects(verbose);
     printf("%s: %d failure(s)\n", failures ? "FAILED" : "passed", failures);

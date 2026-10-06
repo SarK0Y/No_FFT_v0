@@ -1,10 +1,14 @@
 #include "acpcm.h"
+#include "nofft.h"
 
 #include <cmath>
 #include <cstdio>
 #include <cstring>
 #include <cstdlib>
 #include <vector>
+#include <new>
+#include <algorithm>
+
 
 /* ---- LZMA style carryless range coder -------------------------------
  *
@@ -294,9 +298,39 @@ Err plan_channel(const float* s, size_t n, uint16_t bits, ChanPlan* pl)
             rpk = ar;
     }
 
-    double step = 2.0 * rpk / (double)((1u << bits) - 1u);
-    if (step < 1e-9)
-        step = 1.0 / 32768.0;
+    /* Map the largest residual just inside the symbol range, then quantise that
+       step into the 16 bit header field and widen it until the peak really
+       does fit.
+
+       Two things push it out of range.  The formula below puts the peak at
+       (2^bits - 1) / 2, which rounds to lim + 1, one symbol too far.  And the
+       header can only hold the step as 16 bit fixed point, so rounding may land
+       on a *finer* step than the one rpk was measured against.
+
+       Clamping is expensive here.  The filter is recursive, so one clipped
+       sample leaves an error behind that decays only as fast as 1 / (1 - a1),
+       around 30 samples at a1 = 0.97.  Widen the step by a fraction of a
+       symbol instead: it costs a little precision and avoids the clip. */
+    double lim = (double)(((uint32_t)1 << (bits - 1)) - 1u);
+    double cap = (lim - 1.0 > 1.0) ? (lim - 1.0) : 1.0;
+    double step = 2.0 * rpk / (double)(((uint32_t)1 << bits) - 1u);
+    double step_q = quant_fixed(step, 32768.0);
+
+    if (rpk > 0.0) {
+        /* step must be at least rpk / cap, or the largest residual lands past
+           the last symbol.  Round that bound *up*: rounding to nearest can
+           land on a finer step than the bound allows, which is exactly the case
+           that clips. */
+        double need_q = quant_fixed(rpk / cap, 32768.0);
+        if (need_q / 32768.0 < rpk / cap)
+            need_q += 1.0;
+        if (step_q < need_q)
+            step_q = need_q;
+    }
+    if (step_q < 1.0)
+        step_q = 1.0;
+    if (step_q > 65535.0)
+        step_q = 65535.0;
 
     /* Quantise once here, then write the quantised value.  Doing the rounding
        again on the decode side shifts the gain by one LSB and the recursive
@@ -304,7 +338,7 @@ Err plan_channel(const float* s, size_t n, uint16_t bits, ChanPlan* pl)
     pl->peak_q = (uint16_t)quant_clamp(peak, 32768.0, 0.0, 65535.0);
     pl->mean_q = (int16_t)quant_clamp(mean, 32768.0, -32768.0, 32767.0);
     pl->a1_q = (int16_t)quant_clamp(a1, 16384.0, -32768.0, 32767.0);
-    pl->step_q = (uint16_t)quant_clamp(step, 32768.0, 1.0, 65535.0);
+    pl->step_q = (uint16_t)step_q;
 
     pl->peak = (double)pl->peak_q / 32768.0;
     pl->mean = (double)pl->mean_q / 32768.0;
@@ -351,61 +385,6 @@ Err encode_chunk(const float* s, size_t n, const ChanPlan& pl,
     return ERR_OK;
 }
 
-Err decode_chunk(const uint8_t* d, size_t n, size_t* consumed, uint16_t bits,
-                 std::vector<float>* out)
-{
-    DecCtx c;
-    c.d = d;
-    c.n = n;
-    c.pos = 0;
-    c.range = 0xFFFFFFFFu;
-    c.code = 0;
-    for (int i = 0; i < 5; i++)
-        c.code = (c.code << 8) | (uint32_t)(c.pos < c.n ? d[c.pos++] : 0u);
-
-    uint32_t peak_q = c.fixed(16);
-    int32_t mean_q = (int32_t)(int16_t)(uint16_t)c.fixed(16);
-    int32_t a1_q = (int32_t)(int16_t)(uint16_t)c.fixed(16);
-    uint32_t step_q = c.fixed(16);
-    uint32_t hb = c.fixed(8);
-
-    if (hb != (uint32_t)bits)
-        return ERR_BAD_NOFFT;
-    if (peak_q == 0 || step_q == 0)
-        return ERR_BAD_NOFFT;
-
-    double peak = (double)peak_q / 32768.0;
-    double mean = (double)mean_q / 32768.0;
-    double a1 = (double)a1_q / 16384.0;
-    double step = (double)step_q / 32768.0;
-
-    int32_t lim = (int32_t)((1u << (bits - 1)) - 1u);
-    SymModel m;
-    sym_init(&m);
-
-    size_t frames = out->size();
-    if (frames == 0)
-        return ERR_BAD_NOFFT;
-
-    double x0 = (double)(int32_t)(int16_t)(uint16_t)c.fixed(16) / 32768.0;
-    double xh = x0;
-    (*out)[0] = (float)(x0 * peak + mean);
-
-    for (size_t i = 1; i < frames; i++) {
-        int32_t q = dec_sym(&c, &m);
-        if (q > lim - 1)
-            q = lim - 1;
-        if (q < -lim)
-            q = -lim;
-        double pred = a1 * xh;
-        xh = pred + (double)q * step;
-        (*out)[i] = (float)(xh * peak + mean);
-    }
-
-    if (consumed != NULL)
-        *consumed = c.pos;
-    return ERR_OK;
-}
 
 } /* namespace */
 
@@ -515,71 +494,347 @@ Err acpcm_file_info(const char* path, acpcm_info* out)
     return ERR_OK;
 }
 
+struct DecChan {
+    DecCtx rc;
+    SymModel m;
+    double xh;
+    double peak;
+    double mean;
+    double a1;
+    double step;
+    int32_t lim;
+    bool primed;
+
+    Err init(const uint8_t* d, size_t n, uint16_t bits)
+    {
+        rc.d = d;
+        rc.n = n;
+        rc.pos = 0;
+        rc.range = 0xFFFFFFFFu;
+        rc.code = 0;
+        for (int i = 0; i < 5; i++)
+            rc.code = (rc.code << 8) | (uint32_t)(rc.pos < n ? d[rc.pos++] : 0u);
+
+        uint32_t peak_q = rc.fixed(16);
+        int32_t mean_q = (int32_t)(int16_t)(uint16_t)rc.fixed(16);
+        int32_t a1_q = (int32_t)(int16_t)(uint16_t)rc.fixed(16);
+        uint32_t step_q = rc.fixed(16);
+        uint32_t hb = rc.fixed(8);
+
+        if (hb != (uint32_t)bits || peak_q == 0 || step_q == 0)
+            return ERR_BAD_NOFFT;
+
+        peak = (double)peak_q / 32768.0;
+        mean = (double)mean_q / 32768.0;
+        a1 = (double)a1_q / 16384.0;
+        step = (double)step_q / 32768.0;
+        lim = (int32_t)((1u << (bits - 1)) - 1u);
+        sym_init(&m);
+
+        double x0 = (double)(int32_t)(int16_t)(uint16_t)rc.fixed(16) / 32768.0;
+        xh = x0;
+        primed = false;
+        return ERR_OK;
+    }
+
+    double next()
+    {
+        if (!primed) {
+            primed = true;
+            return xh * peak + mean;
+        }
+        int32_t q = dec_sym(&rc, &m);
+        if (q > lim - 1)
+            q = lim - 1;
+        if (q < -lim)
+            q = -lim;
+        double pred = a1 * xh;
+        xh = pred + (double)q * step;
+        return xh * peak + mean;
+    }
+};
+
+struct AcpcmDecoder {
+    acpcm_info info;
+    std::vector<std::vector<uint8_t> > raw;
+    std::vector<DecChan> ch;
+    size_t frames;
+    size_t pos;
+};
+
+Err acpcm_dec_open(const char* path, AcpcmDecoder** out)
+{
+    *out = NULL;
+
+    AcpcmDecoder* d = new (std::nothrow) AcpcmDecoder();
+    if (d == NULL)
+        return ERR_NO_MEMORY;
+
+    Err e = acpcm_file_info(path, &d->info);
+    if (e != ERR_OK) {
+        delete d;
+        return e;
+    }
+
+    size_t ch = d->info.channels;
+    size_t frames = (size_t)d->info.frames;
+    if (frames == 0) {
+        delete d;
+        return ERR_BAD_NOFFT;
+    }
+
+    FILE* f = fopen(path, "rb");
+    if (f == NULL) {
+        delete d;
+        return ERR_OPEN;
+    }
+
+    d->raw.assign(ch, std::vector<uint8_t>());
+    d->ch.assign(ch, DecChan());
+    d->frames = frames;
+    d->pos = 0;
+
+    e = ERR_OK;
+    std::vector<uint8_t> lenbuf(4 * ch);
+    if (fseek(f, (long)(ACPCM_FIXED_HEADER), SEEK_SET) != 0 ||
+        fread(lenbuf.data(), 1, lenbuf.size(), f) != lenbuf.size()) {
+        e = ERR_IO;
+    }
+
+    for (size_t c = 0; c < ch && e == ERR_OK; c++) {
+        uint32_t len = get_u32(lenbuf.data() + 4 * c);
+        if (len == 0) {
+            e = ERR_BAD_NOFFT;
+            break;
+        }
+        d->raw[c].resize(len);
+        if (fread(d->raw[c].data(), 1, len, f) != len)
+            e = ERR_IO;
+    }
+    fclose(f);
+
+    for (size_t c = 0; c < ch && e == ERR_OK; c++)
+        e = d->ch[c].init(d->raw[c].data(), d->raw[c].size(), d->info.bits);
+
+    if (e != ERR_OK) {
+        delete d;
+        return e;
+    }
+
+    *out = d;
+    return ERR_OK;
+}
+
+void acpcm_dec_close(AcpcmDecoder* d)
+{
+    delete d;
+}
+
+const acpcm_info* acpcm_dec_info(const AcpcmDecoder* d)
+{
+    return (d == NULL) ? NULL : &d->info;
+}
+
+Err acpcm_dec_read(AcpcmDecoder* d, float* out, size_t max_frames, size_t* got)
+{
+    if (d == NULL || out == NULL || got == NULL)
+        return ERR_BAD_ARGS;
+
+    size_t ch = d->info.channels;
+    size_t done = 0;
+    while (done < max_frames && d->pos < d->frames) {
+        for (size_t c = 0; c < ch; c++)
+            out[done * ch + c] = (float)d->ch[c].next();
+        done++;
+        d->pos++;
+    }
+    *got = done;
+    return ERR_OK;
+}
+
 Err acpcm_decode(const char* path, pcm_buf* out)
 {
     memset(out, 0, sizeof(*out));
 
-    acpcm_info info;
-    Err ie = acpcm_file_info(path, &info);
-    if (ie != ERR_OK)
-        return ie;
+    AcpcmDecoder* d = NULL;
+    Err e = acpcm_dec_open(path, &d);
+    if (e != ERR_OK)
+        return e;
 
-    size_t ch = info.channels;
-    size_t frames = (size_t)info.frames;
-    uint16_t bits = info.bits;
-
-    if (frames == 0)
-        return ERR_BAD_NOFFT;
-    if (frames > (SIZE_MAX / sizeof(float)) / (ch == 0 ? 1 : ch))
+    size_t ch = d->info.channels;
+    size_t frames = d->frames;
+    if (frames > (SIZE_MAX / sizeof(float)) / (ch == 0 ? 1 : ch)) {
+        acpcm_dec_close(d);
         return ERR_NO_MEMORY;
-
-    FILE* f = fopen(path, "rb");
-    if (f == NULL)
-        return ERR_OPEN;
-
-    std::vector<uint8_t> lenbuf(4 * ch);
-    if (fseek(f, (long)(ACPCM_FIXED_HEADER), SEEK_SET) != 0 ||
-        fread(lenbuf.data(), 1, lenbuf.size(), f) != lenbuf.size()) {
-        fclose(f);
-        return ERR_IO;
     }
-
-    std::vector<std::vector<uint8_t> > raw(ch);
-    for (size_t c = 0; c < ch; c++) {
-        uint32_t len = get_u32(lenbuf.data() + 4 * c);
-        if (len == 0) {
-            fclose(f);
-            return ERR_BAD_NOFFT;
-        }
-        raw[c].resize(len);
-        if (fread(raw[c].data(), 1, len, f) != len) {
-            fclose(f);
-            return ERR_IO;
-        }
-    }
-    fclose(f);
 
     float* buf = (float*)malloc(frames * ch * sizeof(float));
-    if (buf == NULL)
+    if (buf == NULL) {
+        acpcm_dec_close(d);
         return ERR_NO_MEMORY;
-
-    std::vector<float> scratch(frames);
-    for (size_t c = 0; c < ch; c++) {
-        size_t used = 0;
-        scratch.assign(frames, 0.0f);
-        Err e = decode_chunk(raw[c].data(), raw[c].size(), &used, bits, &scratch);
-        if (e != ERR_OK) {
-            free(buf);
-            return e;
-        }
-        for (size_t i = 0; i < frames; i++)
-            buf[i * ch + c] = scratch[i];
     }
+
+    size_t done = 0;
+    while (done < frames) {
+        size_t got = 0;
+        e = acpcm_dec_read(d, buf + done * ch, frames - done, &got);
+        if (e != ERR_OK || got == 0) {
+            free(buf);
+            acpcm_dec_close(d);
+            return (e == ERR_OK) ? ERR_BAD_NOFFT : e;
+        }
+        done += got;
+    }
+    uint32_t rate = d->info.sample_rate;
+    uint16_t chans = (uint16_t)ch;
+    acpcm_dec_close(d);
 
     out->samples = buf;
     out->count = frames * ch;
-    out->channels = (uint16_t)ch;
-    out->sample_rate = info.sample_rate;
-
+    out->channels = chans;
+    out->sample_rate = rate;
+    out->sample_rate = rate;
     return ERR_OK;
+}
+
+
+#ifdef HAVE_ALSA
+#include <alsa/asoundlib.h>
+#endif
+
+#define ACPCM_BLOCK_FRAMES 2048
+
+#ifndef HAVE_ALSA
+
+Err acpcm_play(const char* path, const char* device)
+{
+    (void)path;
+    (void)device;
+    return ERR_UNSUPPORTED_FMT;
+}
+
+#else
+
+static int alsa_write_all(snd_pcm_t* pcm, const float* buf,
+                          snd_pcm_uframes_t frames, unsigned chans)
+{
+    const uint8_t* p = (const uint8_t*)buf;
+    snd_pcm_uframes_t left = frames;
+    while (left > 0) {
+        snd_pcm_sframes_t n = snd_pcm_writei(pcm, p, left);
+        if (n < 0) {
+            int r = snd_pcm_recover(pcm, (int)n, 0);
+            if (r < 0)
+                return -1;
+            continue;
+        }
+        p += (size_t)n * chans * 4u;
+        left -= (snd_pcm_uframes_t)n;
+    }
+    return 0;
+}
+
+Err acpcm_play(const char* path, const char* device)
+{
+    AcpcmDecoder* d = NULL;
+    Err e = acpcm_dec_open(path, &d);
+    if (e != ERR_OK)
+        return e;
+
+    snd_pcm_t* pcm = NULL;
+    int err = snd_pcm_open(&pcm, (device != NULL) ? device : "default",
+                           SND_PCM_STREAM_PLAYBACK, 0);
+    if (err < 0) {
+        acpcm_dec_close(d);
+        return ERR_OPEN;
+    }
+
+    snd_pcm_hw_params_t* hw = NULL;
+    snd_pcm_hw_params_malloc(&hw);
+    if (hw == NULL) {
+        snd_pcm_close(pcm);
+        acpcm_dec_close(d);
+        return ERR_NO_MEMORY;
+    }
+
+    snd_pcm_hw_params_any(pcm, hw);
+    unsigned rate = d->info.sample_rate;
+    unsigned chans = d->info.channels;
+    snd_pcm_hw_params_set_access(pcm, hw, SND_PCM_ACCESS_RW_INTERLEAVED);
+    snd_pcm_hw_params_set_format(pcm, hw, SND_PCM_FORMAT_FLOAT_LE);
+    snd_pcm_hw_params_set_channels(pcm, hw, chans);
+    snd_pcm_hw_params_set_rate_near(pcm, hw, &rate, NULL);
+
+    if (snd_pcm_hw_params(pcm, hw) < 0) {
+        snd_pcm_hw_params_free(hw);
+        snd_pcm_close(pcm);
+        acpcm_dec_close(d);
+        return ERR_UNSUPPORTED_FMT;
+    }
+    snd_pcm_hw_params_free(hw);
+
+    float* block = (float*)malloc((size_t)ACPCM_BLOCK_FRAMES * chans * sizeof(float));
+    if (block == NULL) {
+        snd_pcm_close(pcm);
+        acpcm_dec_close(d);
+        return ERR_NO_MEMORY;
+    }
+
+    for (;;) {
+        size_t got = 0;
+        e = acpcm_dec_read(d, block, ACPCM_BLOCK_FRAMES, &got);
+        if (e != ERR_OK) {
+            free(block);
+            snd_pcm_close(pcm);
+            acpcm_dec_close(d);
+            return e;
+        }
+        if (got == 0)
+            break;
+        if (alsa_write_all(pcm, block, (snd_pcm_uframes_t)got, chans) != 0) {
+            free(block);
+            snd_pcm_close(pcm);
+            acpcm_dec_close(d);
+            return ERR_IO;
+        }
+    }
+
+    snd_pcm_drain(pcm);
+    free(block);
+    snd_pcm_close(pcm);
+    acpcm_dec_close(d);
+    return ERR_OK;
+}
+
+#endif
+
+Err acpcm_gen(const char* path, double seconds, uint32_t channels, uint32_t sample_rate)
+{
+    if (seconds <= 0.0 || channels == 0 || channels > 8 || sample_rate == 0)
+        return ERR_BAD_ARGS;
+
+    size_t frames = (size_t)(seconds * (double)sample_rate);
+    pcm_buf p;
+    p.samples = (float*)malloc(frames * channels * sizeof(float));
+    if (p.samples == NULL)
+        return ERR_NO_MEMORY;
+    p.count = frames * channels;
+    p.channels = (uint16_t)channels;
+    p.sample_rate = sample_rate;
+
+    for (size_t i = 0; i < frames; i++) {
+        double t = (double)i / (double)sample_rate;
+        double a = 0.45 * sin(6.283185307179586 * 440.0 * t);
+        double b = 0.30 * sin(6.283185307179586 * 661.0 * t);
+        double f = 20.0 + (8000.0 - 20.0) * ((double)i / (double)frames);
+        double c = 0.20 * sin(6.283185307179586 * f * t);
+        for (uint32_t j = 0; j < channels; j++) {
+            p.samples[i * channels + j] = (float)(a + b * (double)(j + 1) / (double)channels
+                                                   + c * (double)(j + 1));
+        }
+    }
+
+    Err e = wav_save(path, &p);
+    pcm_free(&p);
+    return e;
 }

@@ -54,7 +54,7 @@ typedef struct {
     uint64_t total;      /* whole file size */
 } acpcm_info;
 
-/* p->samples is interleaved.  `bits` outside ACPPCM_BITS_MIN..ACPCM_BITS_MAX is
+/* p->samples is interleaved.  `bits` outside ACPCM_BITS_MAX..ACPCM_BITS_MAX is
    rejected with ERR_RANGE. */
 Err acpcm_encode(const char* path, const pcm_buf* p, uint16_t bits);
 
@@ -62,5 +62,40 @@ Err acpcm_decode(const char* path, pcm_buf* out);
 
 /* Header only, no decoding. */
 Err acpcm_file_info(const char* path, acpcm_info* out);
+
+/* ---- streaming decode ----
+ *
+ * Every channel is its own range-coded stream, so a stereo file cannot be
+ * decoded one channel at a time and stitched together afterwards without
+ * buffering the whole thing.  This advances all channels in lockstep and
+ * interleaves them as it goes, which is what makes bounded-memory playback
+ * possible.
+ */
+struct AcpcmDecoder;
+
+/* Reads the container and both channels' headers; no audio is decoded yet. */
+Err acpcm_dec_open(const char* path, AcpcmDecoder** out);
+void acpcm_dec_close(AcpcmDecoder* d);
+const acpcm_info* acpcm_dec_info(const AcpcmDecoder* d);
+
+/* Decodes up to max_frames interleaved frames into `out`, which must have room
+   for max_frames * channels floats.  *got is the number of frames produced; a
+   short count means end of stream.  Memory use does not depend on file length. */
+Err acpcm_dec_read(AcpcmDecoder* d, float* out, size_t max_frames, size_t* got);
+
+/* ---- playback ----
+ *
+ * Decodes straight to ALSA, so a long file does not have to be held in memory.
+ * `device` may be NULL for the default.  Built without ALSA the call reports
+ * ERR_UNSUPPORTED_FMT and the codec still encodes and decodes.
+ */
+Err acpcm_play(const char* path, const char* device);
+
+/* ---- test signal ----
+ *
+ * A deterministic stereo/mono tone-and-chirp WAV, so the codec can be checked
+ * without shipping an input file.
+ */
+Err acpcm_gen(const char* path, double seconds, uint32_t channels, uint32_t sample_rate);
 
 #endif
