@@ -8,7 +8,21 @@
 #include <unistd.h>
 #include <errno.h>
 #include <sys/wait.h>
+#include <cmath>
 
+static double compute_snr(const float* a, const float* b, size_t n)
+{
+    double num = 0.0, den = 0.0;
+    for (size_t i = 0; i < n; i++) {
+        double e = (double)a[i] - (double)b[i];
+        double s = (double)a[i];
+        num += e*e;
+        den += s*s;
+    }
+    if (den <= 0.0) return 999.0;
+    if (num <= 0.0) return 999.0;
+    return 10.0 * log10(den / num);
+}
 static void usage(const char* argv0)
 {
     fprintf(stderr,
@@ -370,45 +384,66 @@ int main(int argc, char** argv)
 
     if (strcmp(argv[1], "ac-encode") == 0) {
         acpcm_info info;
-        uint32_t bits;
+        uint32_t bits = 6;
+        bool show_snr = false;
+        const char* in = NULL;
+        const char* out = NULL;
 
-        if (argc < 4) {
+        for (int i = 2; i < argc; i++) {
+            if (strcmp(argv[i], "-snr") == 0) {
+                show_snr = true;
+                continue;
+            }
+            if (argv[i][0] == '-') continue;
+            if (in == NULL) { in = argv[i]; continue; }
+            if (out == NULL) { out = argv[i]; continue; }
+            bits = parse_u32(argv[i], 6);
+        }
+        if (in == NULL || out == NULL) {
             usage(argv[0]);
             return 2;
         }
-
-        bits = parse_u32(argc > 4 ? argv[4] : NULL, 6);
         if (bits < ACPCM_BITS_MIN || bits > ACPCM_BITS_MAX) {
             fprintf(stderr, "bits must be %d..%d\n", ACPCM_BITS_MIN, ACPCM_BITS_MAX);
             return 2;
         }
 
-        e = wav_load(argv[2], &pcm);
+        e = wav_load(in, &pcm);
         if (e != ERR_OK) {
-            fprintf(stderr, "%s: %s\n", argv[2], g_err_str(e));
+            fprintf(stderr, "%s: %s\n", in, g_err_str(e));
             return 1;
         }
 
-        e = acpcm_encode(argv[3], &pcm, (uint16_t)bits);
+        e = acpcm_encode(out, &pcm, (uint16_t)bits);
         if (e != ERR_OK) {
-            fprintf(stderr, "%s: %s\n", argv[3], g_err_str(e));
+            fprintf(stderr, "%s: %s\n", out, g_err_str(e));
             pcm_free(&pcm);
             return 1;
         }
 
-        if (acpcm_file_info(argv[3], &info) == ERR_OK && info.frames != 0) {
+        if (acpcm_file_info(out, &info) == ERR_OK && info.frames != 0) {
             double bps = 8.0 * (double)info.payload /
                          ((double)info.frames * (double)info.channels);
             fprintf(stderr,
                     "%s -> %s  %u ch  %u Hz  bits=%u  %.4f b/sample  %llu bytes\n",
-                    argv[2], argv[3], pcm.channels, pcm.sample_rate, bits, bps,
+                    in, out, pcm.channels, pcm.sample_rate, bits, bps,
                     (unsigned long long)info.payload);
+        }
+
+        if (show_snr) {
+            pcm_buf decb;
+            memset(&decb, 0, sizeof(decb));
+            e = acpcm_decode(out, &decb);
+            if (e == ERR_OK && decb.count == pcm.count) {
+                double snr = compute_snr(pcm.samples, decb.samples, pcm.count);
+                fprintf(stderr, "SNR: %.2f dB\n", snr);
+            }
+            pcm_free(&decb);
         }
 
         pcm_free(&pcm);
         return 0;
     }
-
     if (strcmp(argv[1], "ac-decode") == 0) {
         if (argc < 4) {
             usage(argv[0]);
