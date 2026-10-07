@@ -9,6 +9,12 @@
 #include <new>
 #include <algorithm>
 
+/* Measurement build: behaviour identical to acpcm.cpp, plus a tunable basket
+   meter and a refit counter for the experiment harness. */
+int g_acp2_den = 8;
+int g_acp2_pct = 1;
+long g_acp2_updates = 0;
+
 
 /* ---- LZMA style carryless range coder -------------------------------
  *
@@ -364,10 +370,9 @@ Err plan_channel(const float* s, size_t n, uint16_t bits, ChanPlan* pl)
  * A basket is the block's worth of residuals about to be coded.  When a1 is
  * wrong for the material in it, |q| climbs into the range that costs real
  * bits per sample (a unary run plus mantissa) even though it is nowhere near
- * the symbol limit, so the meter counts |q| >= lim / ACP2_BASKET_DEN and
- * fires the refit once that fraction of the block looks expensive. */
-const int ACP2_BASKET_DEN = 8;
-const int ACP2_DRIFT_PCT  = 1;
+ * the symbol limit, so the meter counts |q| >= lim / g_acp2_den and
+ * fires the refit once that fraction of the block looks expensive.
+ * Tunables and the refit counter live at the top of this file. */
 
 /* Least squares a1 over the source pairs (j-1, j), j in [j0, j1).  Quantised
    exactly like plan_channel, so encoder and decoder keep the same value; a
@@ -421,13 +426,14 @@ Err encode_chunk(const float* s, size_t n, const ChanPlan& pl,
             if (policy == ACP2_ALWAYS) {
                 upd = 1;
             } else if (policy == ACP2_DRIFT) {
-                size_t need = ((size_t)block_len * (size_t)ACP2_DRIFT_PCT) / 100u;
+                size_t need = ((size_t)block_len * (size_t)g_acp2_pct) / 100u;
                 if (need == 0)
                     need = 1;
                 upd = (severe >= need);
             }
             e.bit(&m.p_flag, upd);
             if (upd) {
+                g_acp2_updates++;
                 size_t jb = i - (size_t)block_len;
                 if (jb == 0)
                     jb = 1;
@@ -447,7 +453,7 @@ Err encode_chunk(const float* s, size_t n, const ChanPlan& pl,
             q = -lim;
         if (policy == ACP2_DRIFT && block_len != 0) {
             int32_t aq = (q < 0) ? -q : q;
-            if (aq * ACP2_BASKET_DEN >= lim)
+            if (aq * g_acp2_den >= lim)
                 severe++;
         }
         enc_sym(&e, &m, q);

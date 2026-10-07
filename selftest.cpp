@@ -71,6 +71,30 @@ static Err trip(const pcm_buf* in, uint16_t bits, pcm_buf* out)
     return e;
 }
 
+/* Same, NFA1 or NFA2, and reports the payload rate in bits per sample. */
+static Err trip_x(const pcm_buf* in, uint16_t bits, int v2, uint32_t block_len,
+                  acpcm_p2_policy pol, pcm_buf* out, double* bps)
+{
+    char path[512];
+    Err e;
+
+    temp_path(path, sizeof(path), "drift");
+    e = v2 ? acpcm_encode2(path, in, bits, block_len, pol)
+           : acpcm_encode(path, in, bits);
+    if (e == ERR_OK) {
+        if (bps != NULL) {
+            acpcm_info info;
+            memset(&info, 0, sizeof(info));
+            if (acpcm_file_info(path, &info) == ERR_OK && info.frames != 0)
+                *bps = 8.0 * (double)info.payload /
+                       ((double)info.frames * (double)info.channels);
+        }
+        e = acpcm_decode(path, out);
+    }
+    remove(path);
+    return e;
+}
+
 /* Signals that carry no information the quantiser must throw away, plus the
    two cases that cannot be bit exact: a two frame signal, and a steady tone
    whose best one step predictor sits right on the stability clamp. */
@@ -467,6 +491,158 @@ static void test_rejects(int verbose)
     pcm_free(&in);
 }
 
+/* NFA2: a basket meter watches the residuals and asks for an a1 refit when
+   they start costing bits.  What must hold: the never policy is bit identical
+   to NFA1 (reading boundary flags alone must not touch the audio), flat
+   signals stay exact under every policy, and a nonstationary signal at least
+   decodes as well as it did with one global predictor.  The rate table is the
+   experiment, reported not asserted: on stationary material drift may lose. */
+static void test_drift(int verbose)
+{
+    const size_t frames = 12000;
+    const uint32_t bl = 1024;
+    pcm_buf in, o1, o2;
+    char det[192];
+    double snr1 = 0.0;
+    double bps1 = 0.0, bps_never = 0.0, bps_always = 0.0, bps_drift = 0.0;
+
+    memset(&in, 0, sizeof(in));
+    memset(&o1, 0, sizeof(o1));
+    memset(&o2, 0, sizeof(o2));
+    in.count = frames;
+    in.channels = 1;
+    in.sample_rate = 44100;
+    in.samples = (float*)malloc(in.count * sizeof(float));
+    if (in.samples == NULL)
+        return;
+
+    /* first half: a smooth low tone, whose best one step gain sits on the
+       stability clamp; second half: white noise, whose best gain is 0.  One
+       global fit has to compromise, so a refit at the midpoint is worth
+       real bits. */
+    rng_seed(0xD1FFu);
+    for (size_t i = 0; i < frames; i++) {
+        if (i < frames / 2)
+            in.samples[i] = (float)(0.4 * sin(2.0 * 3.14159265358979 *
+                                              110.0 * (double)i / 44100.0));
+        else
+            in.samples[i] = 0.35f * rng_next();
+    }
+
+    /* invariant a: v2 never == v1 */
+    Err e = trip_x(&in, 6, 0, 0, ACP2_NEVER, &o1, &bps1);
+    if (e == ERR_OK)
+        e = trip_x(&in, 6, 1, bl, ACP2_NEVER, &o2, &bps_never);
+    if (e != ERR_OK || o1.count != frames || o2.count != frames) {
+        snprintf(det, sizeof(det), "%s", g_err_str(e));
+        check(0, verbose, "nfa2 round trips", det);
+        pcm_free(&in);
+        pcm_free(&o1);
+        pcm_free(&o2);
+        return;
+    }
+    check(same(&o1, &o2), verbose, "v2 never decodes bit identical to v1",
+          "boundary flags must not touch the audio");
+    snr1 = (double)nofft_decode_snr_db(in.samples, o1.samples, in.count);
+
+    /* invariant b: flat signals stay exact under the refitting policies */
+    {
+        static const struct {
+            const char* name;
+            float val;
+            acpcm_p2_policy pol;
+        } flat[] = {
+            { "silence exact under drift", 0.0f, ACP2_DRIFT },
+            { "dc exact under always",     0.75f, ACP2_ALWAYS },
+        };
+        for (size_t k = 0; k < sizeof(flat) / sizeof(flat[0]); k++) {
+            pcm_buf fi, fo;
+            Err fe;
+            memset(&fi, 0, sizeof(fi));
+            memset(&fo, 0, sizeof(fo));
+            fi.count = 4096;
+            fi.channels = 1;
+            fi.sample_rate = 44100;
+            fi.samples = (float*)malloc(fi.count * sizeof(float));
+            if (fi.samples == NULL)
+                break;
+            for (size_t i = 0; i < fi.count; i++)
+                fi.samples[i] = flat[k].val;
+            fe = trip_x(&fi, 6, 1, bl, flat[k].pol, &fo, NULL);
+            check(fe == ERR_OK && fo.count == fi.count && same(&fi, &fo),
+                  verbose, flat[k].name, NULL);
+            pcm_free(&fi);
+            pcm_free(&fo);
+        }
+    }
+
+    /* invariant c: the nonstationary signal under the refitting policies */
+    {
+        static const struct {
+            const char* name;
+            acpcm_p2_policy pol;
+            double* bps;
+        } pols[] = {
+            { "v2 always holds quality", ACP2_ALWAYS, &bps_always },
+            { "v2 drift holds quality",  ACP2_DRIFT,  &bps_drift },
+        };
+        for (size_t k = 0; k < sizeof(pols) / sizeof(pols[0]); k++) {
+            pcm_buf fo;
+            double snr;
+            Err fe;
+            memset(&fo, 0, sizeof(fo));
+            fe = trip_x(&in, 6, 1, bl, pols[k].pol, &fo, pols[k].bps);
+            snr = (fe == ERR_OK && fo.count == in.count)
+                      ? (double)nofft_decode_snr_db(in.samples, fo.samples, in.count)
+                      : -99.0;
+            snprintf(det, sizeof(det), "snr=%.2f dB (v1 %.2f), %.4f b/sample",
+                     snr, snr1, *pols[k].bps);
+            check(fe == ERR_OK && fo.count == in.count && snr >= snr1 - 2.0,
+                  verbose, pols[k].name, det);
+            pcm_free(&fo);
+        }
+    }
+
+    /* experiment d: what the refit machinery costs and buys */
+    snprintf(det, sizeof(det), "v1 %.4f  never %.4f  always %.4f  drift %.4f",
+             bps1, bps_never, bps_always, bps_drift);
+    check(1, verbose, "rate table (b/sample, bits=6)", det);
+
+    /* invariant e: malformed NFA2 is rejected, not misparsed */
+    {
+        char path[512];
+        pcm_buf fo;
+
+        temp_path(path, sizeof(path), "drift");
+        expect_err(acpcm_encode2(path, &in, 6, 0, ACP2_DRIFT), ERR_RANGE,
+                   verbose, "rejects block_len 0");
+        expect_err(acpcm_encode2(path, &in, 6, bl, (acpcm_p2_policy)9),
+                   ERR_RANGE, verbose, "rejects an unknown policy");
+
+        e = acpcm_encode2(path, &in, 6, bl, ACP2_DRIFT);
+        check(e == ERR_OK, verbose, "writes a valid nfa2 file",
+              e == ERR_OK ? NULL : g_err_str(e));
+        if (e == ERR_OK) {
+            FILE* f2 = fopen(path, "r+b");
+            if (f2 != NULL) {
+                uint8_t z[4] = { 0, 0, 0, 0 };
+                fseek(f2, ACPCM_FIXED_HEADER, SEEK_SET);
+                fwrite(z, 1, sizeof(z), f2);
+                fclose(f2);
+            }
+            memset(&fo, 0, sizeof(fo));
+            expect_err(acpcm_decode(path, &fo), ERR_BAD_NOFFT, verbose,
+                       "rejects block_len 0 in the header");
+            pcm_free(&fo);
+        }
+        remove(path);
+    }
+
+    pcm_free(&in);
+    pcm_free(&o1);
+    pcm_free(&o2);
+}
+
 Err acpcm_selftest(int verbose)
 {
     failures = 0;
@@ -475,6 +651,7 @@ Err acpcm_selftest(int verbose)
     test_widths(verbose);
     test_no_clipping(verbose);
     test_noise_bound(verbose);
+    test_drift(verbose);
     test_rejects(verbose);
     printf("%s: %d failure(s)\n", failures ? "FAILED" : "passed", failures);
     return failures ? ERR_BAD_ARGS : ERR_OK;

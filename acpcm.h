@@ -33,6 +33,15 @@
  * encoder then codes the already-quantised value.  Rounding on the way out and
  * again on the way back in desynchronises the two sides by one LSB, and because
  * DPCM is recursive that desync persists to the last sample.
+ *
+ * NFA2 (magic "NFA2") is the same codec with a forward adaptive predictor.
+ * The fixed header gains uint32 block_len at offset 20 (24 bytes total) and
+ * the length table starts there instead of at 20.  Inside every chunk, before
+ * the sample at i = k * block_len, the encoder sends one adaptive binary flag
+ * and, when the flag is set, a new 16 bit a1_q that replaces the predictor
+ * gain for the rest of the chunk.  The encoder decides the flags (policy:
+ * never / always / drift); the decoder only obeys.  NFA1 files carry
+ * block_len = 0 and no flags, so both formats share one decoder.
  */
 
 #include <stdint.h>
@@ -40,15 +49,27 @@
 
 #include "nofft.h"
 
-#define ACPCM_MAGIC        "NFA1"
-#define ACPCM_FIXED_HEADER 20
-#define ACPCM_BITS_MIN     2
-#define ACPCM_BITS_MAX     24
+#define ACPCM_MAGIC         "NFA1"
+#define ACPCM_MAGIC2        "NFA2"
+#define ACPCM_FIXED_HEADER  20
+#define ACPCM_FIXED_HEADER2 24
+#define ACPCM_BITS_MIN      2
+#define ACPCM_BITS_MAX      24
+
+/* NFA2: when does the encoder refit a1 at a block boundary?  NEVER keeps the
+   stream bit identical to NFA1 (flags all zero); the refit itself is decided
+   encoder side, the decoder only reads what was sent. */
+typedef enum {
+    ACP2_NEVER  = 0,
+    ACP2_ALWAYS = 1,
+    ACP2_DRIFT  = 2
+} acpcm_p2_policy;
 
 typedef struct {
     uint16_t bits;       /* quantiser width actually used */
     uint32_t channels;
     uint32_t sample_rate;
+    uint32_t block_len;  /* NFA2 block length in frames, 0 for NFA1 */
     uint64_t frames;     /* frames per channel */
     uint64_t payload;    /* bytes of range coded payload */
     uint64_t total;      /* whole file size */
@@ -57,6 +78,11 @@ typedef struct {
 /* p->samples is interleaved.  `bits` outside ACPCM_BITS_MAX..ACPCM_BITS_MAX is
    rejected with ERR_RANGE. */
 Err acpcm_encode(const char* path, const pcm_buf* p, uint16_t bits);
+
+/* NFA2 with refits every block_len frames; block_len 0 and a policy outside
+   NEVER..DRIFT are rejected with ERR_RANGE. */
+Err acpcm_encode2(const char* path, const pcm_buf* p, uint16_t bits,
+                  uint32_t block_len, acpcm_p2_policy policy);
 
 Err acpcm_decode(const char* path, pcm_buf* out);
 
