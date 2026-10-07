@@ -48,9 +48,9 @@ nofft roundtrip <in.wav>              [frame_len] [degree] [f32|f16] [interp|lea
 nofft convert  <in.mp3> <out.no.fft>  [frame_len] [degree] [f32|f16] [interp|least-sq]
 nofft play     <in.no.fft>
 
-nofft ac-encode   <in.wav> <out.nadc> [bits]
+nofft ac-encode   <in.wav> <out.nadc> [bits] [-snr] [-block N] [-policy never|always|drift]
 nofft ac-decode   <in.nadc> <out.wav>
-nofft ac-roundtrip <in.wav>            [bits]
+nofft ac-roundtrip <in.wav>            [bits] [-block N] [-policy never|always|drift]
 nofft ac-info     <in.nadc>
 nofft ac-play     <in.nadc>
 nofft selftest
@@ -313,6 +313,7 @@ decoder.
 ```sh
 nofft ac-roundtrip song.wav 6     # 30.7 dB at 3.03 bits per sample
 nofft ac-encode song.wav song.nadc 6
+nofft ac-roundtrip song.wav 6 -block 1024 -policy drift   # NFA2 refits
 nofft ac-decode song.nadc song.out.wav
 nofft ac-play song.nadc | mpv -
 ```
@@ -399,8 +400,19 @@ NFA1 fits `a1` once per channel and holds it for the whole file. When the
 material changes character — a quiet passage into percussion, a tone into noise
 — that one compromise gain costs bits for the rest of the file. NFA2 lets the
 encoder replace `a1` at fixed block boundaries and tell the decoder when it
-did. It exists as an API (`acpcm_encode2`); there are no `ac-*` CLI flags for
-it yet.
+did. It is enabled per encode with `-block N` (the refit window in frames) and
+`-policy never|always|drift` (default `drift`; `-policy` needs `-block`):
+
+```sh
+nofft ac-encode song.wav song.nadc 6 -block 1024 -policy drift
+nofft ac-roundtrip song.wav 6 -block 1024        # policy defaults to drift
+nofft ac-info song.nadc                          # ... block=1024
+```
+
+The library API is `acpcm_encode2` with `acpcm_p2_policy`; the decoder needs
+nothing new and reads both magics. `ac-info` and the encoder/roundtrip summary
+echo `block=` and `policy=` so a stream's shape is visible without a hex
+editor.
 
 Container: magic `NFA2`, and the fixed header gains one field, so the length
 table starts at 24 instead of 20:

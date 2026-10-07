@@ -34,14 +34,17 @@ static void usage(const char* argv0)
         "  %s play <in.no_fft>                 (WAV to stdout, for piping)\n"
         "\n"
         "acpcm, sample-domain DPCM with a range coder (no polynomial):\n"
-        "  %s ac-encode <in.wav> <out.nadc> [bits]     (bits 2..24, default 6)\n"
+        "  %s ac-encode <in.wav> <out.nadc> [bits] [-snr] [-block N] [-policy never|always|drift]\n"
         "  %s ac-decode <in.nadc> <out.wav>\n"
         "  %s ac-play <in.nadc>               (WAV to stdout, for piping)\n"
         "  %s ac-info <in.nadc>\n"
-        "  %s ac-roundtrip <in.wav> [bits]\n"
+        "  %s ac-roundtrip <in.wav> [bits] [-block N] [-policy never|always|drift]\n"
         "  %s ac-gen <out.wav> [seconds] [ch] [rate]\n"
         "  %s ac-play-alsa <in.nadc> [-d device]\n"
-        "  %s selftest\n",
+        "  %s selftest\n"
+        "    -block N       write NFA2, refit the predictor every N frames\n"
+        "    -policy when   when to refit: never, always or drift (default;\n"
+        "                   needs -block; NFA2 with never still costs flags)\n",
         argv0, argv0, argv0, argv0, argv0,
         argv0, argv0, argv0, argv0, argv0, argv0, argv0, argv0);
 }
@@ -58,6 +61,35 @@ static uint32_t parse_u32(const char* s, uint32_t dflt)
         return dflt;
 
     return (uint32_t)v;
+}
+
+/* Parses an NFA2 refit policy. Returns 0 on a bad value. */
+static int parse_policy(const char* s, acpcm_p2_policy* out)
+{
+    if (s == NULL || *s == '\0')
+        return 0;
+    if (strcmp(s, "never") == 0) {
+        *out = ACP2_NEVER;
+        return 1;
+    }
+    if (strcmp(s, "always") == 0) {
+        *out = ACP2_ALWAYS;
+        return 1;
+    }
+    if (strcmp(s, "drift") == 0) {
+        *out = ACP2_DRIFT;
+        return 1;
+    }
+    return 0;
+}
+
+static const char* policy_str(acpcm_p2_policy p)
+{
+    if (p == ACP2_ALWAYS)
+        return "always";
+    if (p == ACP2_DRIFT)
+        return "drift";
+    return "never";
 }
 
 /* Parses the optional trailing fit selector. Returns 0 on a bad value. */
@@ -385,6 +417,9 @@ int main(int argc, char** argv)
     if (strcmp(argv[1], "ac-encode") == 0) {
         acpcm_info info;
         uint32_t bits = 6;
+        uint32_t block_len = 0;
+        acpcm_p2_policy policy = ACP2_DRIFT;
+        bool have_policy = false;
         bool show_snr = false;
         const char* in = NULL;
         const char* out = NULL;
@@ -394,13 +429,41 @@ int main(int argc, char** argv)
                 show_snr = true;
                 continue;
             }
-            if (argv[i][0] == '-') continue;
+            if (strcmp(argv[i], "-block") == 0) {
+                if (i + 1 >= argc) {
+                    fprintf(stderr, "-block needs a frame count (>= 1)\n");
+                    return 2;
+                }
+                block_len = parse_u32(argv[++i], 0);
+                if (block_len == 0) {
+                    fprintf(stderr, "-block must be >= 1\n");
+                    return 2;
+                }
+                continue;
+            }
+            if (strcmp(argv[i], "-policy") == 0) {
+                if (i + 1 >= argc || !parse_policy(argv[i + 1], &policy)) {
+                    fprintf(stderr, "policy must be never, always or drift\n");
+                    return 2;
+                }
+                have_policy = true;
+                i++;
+                continue;
+            }
+            if (argv[i][0] == '-') {
+                fprintf(stderr, "unknown flag: %s\n", argv[i]);
+                return 2;
+            }
             if (in == NULL) { in = argv[i]; continue; }
             if (out == NULL) { out = argv[i]; continue; }
             bits = parse_u32(argv[i], 6);
         }
         if (in == NULL || out == NULL) {
             usage(argv[0]);
+            return 2;
+        }
+        if (have_policy && block_len == 0) {
+            fprintf(stderr, "-policy needs -block\n");
             return 2;
         }
         if (bits < ACPCM_BITS_MIN || bits > ACPCM_BITS_MAX) {
@@ -414,7 +477,10 @@ int main(int argc, char** argv)
             return 1;
         }
 
-        e = acpcm_encode(out, &pcm, (uint16_t)bits);
+        if (block_len != 0)
+            e = acpcm_encode2(out, &pcm, (uint16_t)bits, block_len, policy);
+        else
+            e = acpcm_encode(out, &pcm, (uint16_t)bits);
         if (e != ERR_OK) {
             fprintf(stderr, "%s: %s\n", out, g_err_str(e));
             pcm_free(&pcm);
@@ -424,9 +490,14 @@ int main(int argc, char** argv)
         if (acpcm_file_info(out, &info) == ERR_OK && info.frames != 0) {
             double bps = 8.0 * (double)info.payload /
                          ((double)info.frames * (double)info.channels);
+            char extra[64];
+            extra[0] = '\0';
+            if (info.block_len != 0)
+                snprintf(extra, sizeof(extra), "  block=%u policy=%s",
+                         info.block_len, policy_str(policy));
             fprintf(stderr,
-                    "%s -> %s  %u ch  %u Hz  bits=%u  %.4f b/sample  %llu bytes\n",
-                    in, out, pcm.channels, pcm.sample_rate, bits, bps,
+                    "%s -> %s  %u ch  %u Hz  bits=%u%s  %.4f b/sample  %llu bytes\n",
+                    in, out, pcm.channels, pcm.sample_rate, bits, extra, bps,
                     (unsigned long long)info.payload);
         }
 
@@ -542,11 +613,15 @@ int main(int argc, char** argv)
         if (info.frames != 0) {
             double bps = 8.0 * (double)info.payload /
                          ((double)info.frames * (double)info.channels);
+            char extra[32];
+            extra[0] = '\0';
+            if (info.block_len != 0)
+                snprintf(extra, sizeof(extra), "  block=%u", info.block_len);
             fprintf(stderr,
-                    "%s  bits=%u  %u ch  %u Hz  %llu frames  %.4f b/sample  %llu bytes\n",
+                    "%s  bits=%u  %u ch  %u Hz  %llu frames  %.4f b/sample  %llu bytes%s\n",
                     argv[2], info.bits, info.channels, info.sample_rate,
                     (unsigned long long)info.frames, bps,
-                    (unsigned long long)info.payload);
+                    (unsigned long long)info.payload, extra);
         }
         return 0;
     }
@@ -555,23 +630,58 @@ int main(int argc, char** argv)
         char* tmp;
         size_t n;
         float snr;
-        uint32_t bits;
+        uint32_t bits = 6;
+        uint32_t block_len = 0;
+        acpcm_p2_policy policy = ACP2_DRIFT;
+        bool have_policy = false;
         double peak = 0.0;
+        const char* in = NULL;
 
-        if (argc < 3) {
+        for (int i = 2; i < argc; i++) {
+            if (strcmp(argv[i], "-block") == 0) {
+                if (i + 1 >= argc) {
+                    fprintf(stderr, "-block needs a frame count (>= 1)\n");
+                    return 2;
+                }
+                block_len = parse_u32(argv[++i], 0);
+                if (block_len == 0) {
+                    fprintf(stderr, "-block must be >= 1\n");
+                    return 2;
+                }
+                continue;
+            }
+            if (strcmp(argv[i], "-policy") == 0) {
+                if (i + 1 >= argc || !parse_policy(argv[i + 1], &policy)) {
+                    fprintf(stderr, "policy must be never, always or drift\n");
+                    return 2;
+                }
+                have_policy = true;
+                i++;
+                continue;
+            }
+            if (argv[i][0] == '-') {
+                fprintf(stderr, "unknown flag: %s\n", argv[i]);
+                return 2;
+            }
+            if (in == NULL) { in = argv[i]; continue; }
+            bits = parse_u32(argv[i], 6);
+        }
+        if (in == NULL) {
             usage(argv[0]);
             return 2;
         }
-
-        bits = parse_u32(argc > 3 ? argv[3] : NULL, 6);
+        if (have_policy && block_len == 0) {
+            fprintf(stderr, "-policy needs -block\n");
+            return 2;
+        }
         if (bits < ACPCM_BITS_MIN || bits > ACPCM_BITS_MAX) {
             fprintf(stderr, "bits must be %d..%d\n", ACPCM_BITS_MIN, ACPCM_BITS_MAX);
             return 2;
         }
 
-        e = wav_load(argv[2], &pcm);
+        e = wav_load(in, &pcm);
         if (e != ERR_OK) {
-            fprintf(stderr, "%s: %s\n", argv[2], g_err_str(e));
+            fprintf(stderr, "%s: %s\n", in, g_err_str(e));
             return 1;
         }
 
@@ -582,7 +692,10 @@ int main(int argc, char** argv)
             return 1;
         }
 
-        e = acpcm_encode(tmp, &pcm, (uint16_t)bits);
+        if (block_len != 0)
+            e = acpcm_encode2(tmp, &pcm, (uint16_t)bits, block_len, policy);
+        else
+            e = acpcm_encode(tmp, &pcm, (uint16_t)bits);
         if (e != ERR_OK) {
             fprintf(stderr, "encode: %s\n", g_err_str(e));
             pcm_free(&pcm);
@@ -591,31 +704,49 @@ int main(int argc, char** argv)
             return 1;
         }
 
-        e = acpcm_decode(tmp, &dec);
-        if (e != ERR_OK) {
-            fprintf(stderr, "decode: %s\n", g_err_str(e));
-            pcm_free(&pcm);
+        {
+            acpcm_info finfo;
+            double bps = -1.0;
+            if (acpcm_file_info(tmp, &finfo) == ERR_OK && finfo.frames != 0)
+                bps = 8.0 * (double)finfo.payload /
+                      ((double)finfo.frames * (double)finfo.channels);
+
+            e = acpcm_decode(tmp, &dec);
+            if (e != ERR_OK) {
+                fprintf(stderr, "decode: %s\n", g_err_str(e));
+                pcm_free(&pcm);
+                remove(tmp);
+                free(tmp);
+                return 1;
+            }
+
             remove(tmp);
             free(tmp);
-            return 1;
+
+            n = (pcm.count < dec.count) ? pcm.count : dec.count;
+            snr = nofft_decode_snr_db(pcm.samples, dec.samples, n);
+
+            for (size_t i = 0; i < dec.count; i++) {
+                double a = dec.samples[i] < 0.0f ? -(double)dec.samples[i]
+                                                 : (double)dec.samples[i];
+                if (a > peak)
+                    peak = a;
+            }
+
+            {
+                char extra[64];
+                extra[0] = '\0';
+                if (block_len != 0)
+                    snprintf(extra, sizeof(extra), "  block=%u policy=%s",
+                             block_len, policy_str(policy));
+                fprintf(stderr,
+                        "bits=%-3u in=%zu out=%zu%s  SNR=%.2f dB  %.4f b/sample"
+                        "  peak=%.4f%s\n",
+                        bits, pcm.count, dec.count, extra, (double)snr,
+                        bps >= 0.0 ? bps : 0.0, peak,
+                        peak > 1.0 ? "  (overshoots full scale)" : "");
+            }
         }
-
-        remove(tmp);
-        free(tmp);
-
-        n = (pcm.count < dec.count) ? pcm.count : dec.count;
-        snr = nofft_decode_snr_db(pcm.samples, dec.samples, n);
-
-        for (size_t i = 0; i < dec.count; i++) {
-            double a = dec.samples[i] < 0.0f ? -(double)dec.samples[i]
-                                             : (double)dec.samples[i];
-            if (a > peak)
-                peak = a;
-        }
-
-        fprintf(stderr, "bits=%-3u in=%zu out=%zu  SNR=%.2f dB  peak=%.4f%s\n",
-                bits, pcm.count, dec.count, (double)snr, peak,
-                peak > 1.0 ? "  (overshoots full scale)" : "");
 
         pcm_free(&pcm);
         pcm_free(&dec);
