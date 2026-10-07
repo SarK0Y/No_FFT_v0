@@ -73,6 +73,31 @@ void rc_enc_fixed(std::vector<uint8_t>& out, uint64_t& low, uint32_t& range,
         rc_enc_bit(out, low, range, cache, cache_size, &p, (int)((v >> i) & 1u));
 }
 
+/* Multi-symbol arithmetic coding from a histogram: the alphabet is the M
+   basket classes, symbol sym gets probability (cnt[sym]+1)/(total+M), so an
+   unobserved class still has a nonzero interval and both sides can decode an
+   empty model.  The encoder and the decoder must round these divisions the
+   same way; they do: both use the exact same floor products on the same
+   (cumulative, total) pair. */
+void rc_enc_multi(std::vector<uint8_t>& out, uint64_t& low, uint32_t& range,
+                  uint8_t& cache, int64_t& cache_size,
+                  const int32_t* cnt, int M, int64_t tot, int sym)
+{
+    int64_t cum = 0;
+    for (int j = 0; j < sym; j++)
+        cum += (int64_t)cnt[j] + 1;
+    int64_t tm = tot + M;
+    uint64_t l = ((uint64_t)range * (uint64_t)cum) / (uint64_t)tm;
+    uint32_t h = (uint32_t)(((uint64_t)range * (uint64_t)(cum + (int64_t)cnt[sym] + 1)) /
+                            (uint64_t)tm);
+    low += l;
+    range = h - (uint32_t)l;
+    if (range == 0)
+        range = 1;
+    while (range < RC_TOP)
+        rc_shift_low(out, low, range, cache, cache_size);
+}
+
 struct EncCtx {
     std::vector<uint8_t> out;
     uint64_t low;
@@ -89,6 +114,10 @@ struct EncCtx {
     void fixed(uint32_t v, int n)
     {
         rc_enc_fixed(out, low, range, cache, cache_size, v, n);
+    }
+    void multi(const int32_t* cnt, int M, int64_t tot, int sym)
+    {
+        rc_enc_multi(out, low, range, cache, cache_size, cnt, M, tot, sym);
     }
     void done() { rc_flush(out, low, range, cache, cache_size); }
 };
@@ -135,6 +164,34 @@ struct DecCtx {
         for (int i = 0; i < n; i++)
             v = (v << 1) | (uint32_t)bit(&p);
         return v;
+    }
+
+    int multi(const int32_t* cnt, int M, int64_t tot)
+    {
+        int64_t tm = tot + M;
+        int64_t cum = 0;
+        int j;
+        for (j = 0; j < M; j++) {
+            int64_t cum_next = cum + (int64_t)cnt[j] + 1;
+            uint32_t hi = (uint32_t)(((uint64_t)range * (uint64_t)cum_next) /
+                                     (uint64_t)tm);
+            if (code < hi)
+                break;
+            cum = cum_next;
+        }
+        if (j >= M)
+            j = M - 1;
+        int64_t cum_hi = cum + (int64_t)cnt[j] + 1;
+        uint32_t lo = (uint32_t)(((uint64_t)range * (uint64_t)cum) /
+                                 (uint64_t)tm);
+        uint32_t hi = (uint32_t)(((uint64_t)range * (uint64_t)cum_hi) /
+                                 (uint64_t)tm);
+        code -= lo;
+        range = hi - lo;
+        if (range == 0)
+            range = 1;
+        norm();
+        return j;
     }
 };
 
@@ -199,6 +256,58 @@ int32_t dec_sym(DecCtx* d, SymModel* m)
 }
 
 
+
+/* ---- NFA3 basket model ----
+ *
+ * The basket is the coarse half of a two-stage symbol.  q == 0 is basket 0;
+ * otherwise basket k is the number of bits of |q| (1..bits-1), so the baskets
+ * grow geometrically wider and the common small residuals get the narrowest
+ * classes.  The histogram counts what was seen and both sides update it, but
+ * only on the even samples of the chunk (j % 2 == 0) so the tally costs half
+ * the stream.  totals are halved when they grow past 2^20, which keeps every
+ * range-coder product in 64 bits.
+ */
+struct BasketModel {
+    int32_t cnt[ACPCM_MAX_BASKETS];
+    int64_t tot;
+};
+
+void basket_init(BasketModel* b)
+{
+    for (int i = 0; i < ACPCM_MAX_BASKETS; i++)
+        b->cnt[i] = 0;
+    b->tot = 0;
+}
+
+void basket_bump(BasketModel* b, int sym)
+{
+    b->cnt[sym]++;
+    b->tot++;
+    if (b->tot > (int64_t)(1 << 20)) {
+        for (int i = 0; i < ACPCM_MAX_BASKETS; i++)
+            b->cnt[i] >>= 1;
+        b->tot >>= 1;
+    }
+}
+
+/* Basket for a clamped residual q.  `classes` is bits+1: 0..bits-1 are real
+   magnitude classes and index `classes-1` is the escape -- a fully saturated
+   q, a transient the predictor cannot reach, which is coded as a raw sample
+   instead of a huge symbol. */
+int basket_class(int32_t q, int32_t lim, int classes)
+{
+    if (q == 0)
+        return 0;
+    uint32_t mag = (q < 0) ? (uint32_t)(-q) : (uint32_t)q;
+    if (mag >= (uint32_t)lim)
+        return classes - 1;
+    int k = 0;
+    while (mag != 0) {
+        k++;
+        mag >>= 1;
+    }
+    return k;
+}
 
 /* ---- little endian helpers ----
  *
@@ -459,11 +568,72 @@ Err encode_chunk(const float* s, size_t n, const ChanPlan& pl,
     return ERR_OK;
 }
 
+/* NFA3: same chunk header and same DPCM state as the NFA1 path, but each
+   symbol is split into a basket index (arithmetic coded from the basket
+   histogram) and the leftover mantissa bits, and a saturated residual is
+   escaped to a full 32 bit raw sample. */
+Err encode_chunk3(const float* s, size_t n, const ChanPlan& pl,
+                  uint16_t bits, std::vector<uint8_t>* out)
+{
+    int32_t lim = (int32_t)((1u << (bits - 1)) - 1u);
+    int classes = (int)bits + 1;
+    BasketModel bm;
+    basket_init(&bm);
+
+    EncCtx e;
+    e.fixed(pl.peak_q, 16);
+    e.fixed((uint32_t)(uint16_t)pl.mean_q, 16);
+    e.fixed((uint32_t)(uint16_t)pl.a1_q, 16);
+    e.fixed(pl.step_q, 16);
+    e.fixed(bits, 8);
+
+    double x0 = (quant_fixed(s[0], 32768.0) / 32768.0 - pl.mean) / pl.peak;
+    double xh = x0;
+    e.fixed((uint32_t)(uint16_t)quant_clamp(x0, 32768.0, -32768.0, 32767.0), 16);
+
+    double a1 = pl.a1;
+    SymModel z;
+    sym_init(&z);
+
+    for (size_t i = 1; i < n; i++) {
+        double src = (s[i] - pl.mean) / pl.peak;
+        double pred = a1 * xh;
+        int32_t q = (int32_t)quant_fixed((src - pred) / pl.step, 1.0);
+        if (q > lim - 1)
+            q = lim - 1;
+        if (q < -lim)
+            q = -lim;
+
+        int cl = basket_class(q, lim, classes);
+        e.multi(bm.cnt, classes, bm.tot, cl);
+        if (cl == classes - 1) {
+            int32_t raw = quant_clamp(src, 32768.0, -32768.0, 32767.0);
+            e.fixed((uint32_t)raw, 32);
+            xh = (double)raw / 32768.0;
+        } else {
+            if (cl != 0) {
+                e.bit(&z.p_sign, q < 0 ? 1 : 0);
+                uint32_t mag = (q < 0) ? (uint32_t)(-q) : (uint32_t)q;
+                for (int j = cl - 2; j >= 0; j--)
+                    e.fixed((mag >> j) & 1u, 1);
+            }
+            xh = pred + (double)q * pl.step;
+        }
+        if ((i % 2) == 0)
+            basket_bump(&bm, cl);
+    }
+
+    e.done();
+    out->swap(e.out);
+    return ERR_OK;
+}
+
 
 } /* namespace */
 
 static Err acpcm_encode_impl(const char* path, const pcm_buf* p, uint16_t bits,
-                             uint32_t block_len, acpcm_p2_policy policy)
+                             uint32_t block_len, acpcm_p2_policy policy,
+                             bool v3)
 {
     if (p == NULL || p->samples == NULL || p->channels == 0)
         return ERR_BAD_ARGS;
@@ -489,8 +659,11 @@ static Err acpcm_encode_impl(const char* path, const pcm_buf* p, uint16_t bits,
         Err e = plan_channel(gath.data(), frames, bits, &pl);
         if (e != ERR_OK)
             return e;
-        e = encode_chunk(gath.data(), frames, pl, bits, &chunks[c],
-                         block_len, policy);
+        if (v3)
+            e = encode_chunk3(gath.data(), frames, pl, bits, &chunks[c]);
+        else
+            e = encode_chunk(gath.data(), frames, pl, bits, &chunks[c],
+                             block_len, policy);
         if (e != ERR_OK)
             return e;
     }
@@ -500,10 +673,11 @@ static Err acpcm_encode_impl(const char* path, const pcm_buf* p, uint16_t bits,
         payload += chunks[c].size();
 
     int v2 = (block_len != 0);
+    const char* magic = v3 ? ACPCM_MAGIC3 : (v2 ? ACPCM_MAGIC2 : ACPCM_MAGIC);
     size_t base = v2 ? (size_t)ACPCM_FIXED_HEADER2 : (size_t)ACPCM_FIXED_HEADER;
     size_t hsz = base + 4 * ch;
     std::vector<uint8_t> hdr(hsz, 0);
-    memcpy(hdr.data(), v2 ? ACPCM_MAGIC2 : ACPCM_MAGIC, 4);
+    memcpy(hdr.data(), magic, 4);
     put_u32(hdr.data() + 4, (uint32_t)frames);
     put_u32(hdr.data() + 8, (uint32_t)bits);
     put_u32(hdr.data() + 12, (uint32_t)ch);
@@ -529,7 +703,7 @@ static Err acpcm_encode_impl(const char* path, const pcm_buf* p, uint16_t bits,
 
 Err acpcm_encode(const char* path, const pcm_buf* p, uint16_t bits)
 {
-    return acpcm_encode_impl(path, p, bits, 0, ACP2_NEVER);
+    return acpcm_encode_impl(path, p, bits, 0, ACP2_NEVER, false);
 }
 
 Err acpcm_encode2(const char* path, const pcm_buf* p, uint16_t bits,
@@ -539,7 +713,12 @@ Err acpcm_encode2(const char* path, const pcm_buf* p, uint16_t bits,
         return ERR_RANGE;
     if ((int)policy < (int)ACP2_NEVER || (int)policy > (int)ACP2_DRIFT)
         return ERR_RANGE;
-    return acpcm_encode_impl(path, p, bits, block_len, policy);
+    return acpcm_encode_impl(path, p, bits, block_len, policy, false);
+}
+
+Err acpcm_encode3(const char* path, const pcm_buf* p, uint16_t bits)
+{
+    return acpcm_encode_impl(path, p, bits, 0, ACP2_NEVER, true);
 }
 
 Err acpcm_file_info(const char* path, acpcm_info* out)
@@ -553,11 +732,16 @@ Err acpcm_file_info(const char* path, acpcm_info* out)
 
     uint8_t mag[4];
     if (fread(mag, 1, 4, f) != 4 ||
-        (memcmp(mag, ACPCM_MAGIC, 4) != 0 && memcmp(mag, ACPCM_MAGIC2, 4) != 0)) {
+        (memcmp(mag, ACPCM_MAGIC, 4) != 0 &&
+         memcmp(mag, ACPCM_MAGIC2, 4) != 0 &&
+         memcmp(mag, ACPCM_MAGIC3, 4) != 0)) {
         fclose(f);
         return ERR_BAD_NOFFT;
     }
-    int v2 = (memcmp(mag, ACPCM_MAGIC2, 4) == 0);
+    int fmt = (memcmp(mag, ACPCM_MAGIC2, 4) == 0)
+                  ? 1
+                  : (memcmp(mag, ACPCM_MAGIC3, 4) == 0 ? 2 : 0);
+    int v2 = (fmt == 1);
 
     uint8_t rest[16]; /* frames, bits, channels, sample_rate */
     if (fread(rest, 1, sizeof(rest), f) != sizeof(rest)) {
@@ -603,6 +787,7 @@ Err acpcm_file_info(const char* path, acpcm_info* out)
     out->channels = (uint16_t)ch;
     out->sample_rate = rate;
     out->block_len = block_len;
+    out->format = (uint8_t)fmt;
     out->frames = frames;
     out->payload = payload;
     out->total = (v2 ? ACPCM_FIXED_HEADER2 : ACPCM_FIXED_HEADER) +
@@ -615,17 +800,20 @@ Err acpcm_file_info(const char* path, acpcm_info* out)
 struct DecChan {
     DecCtx rc;
     SymModel m;
+    BasketModel bm;
     double xh;
     double peak;
     double mean;
     double a1;
     double step;
     int32_t lim;
+    int classes;   /* NFA3: basket alphabet size, bits+1 */
+    int fmt;       /* 0: NFA1, 1: NFA2, 2: NFA3 */
     bool primed;
-    uint32_t block_len;  /* 0: NFA1, no flags */
+    uint32_t block_len;  /* 0: NFA1/NFA3, no flags */
     uint32_t in_block;   /* samples since the last boundary */
 
-    Err init(const uint8_t* d, size_t n, uint16_t bits, uint32_t bl)
+    Err init(const uint8_t* d, size_t n, uint16_t bits, uint32_t bl, int fmt)
     {
         rc.d = d;
         rc.n = n;
@@ -650,6 +838,10 @@ struct DecChan {
         step = (double)step_q / 32768.0;
         lim = (int32_t)((1u << (bits - 1)) - 1u);
         sym_init(&m);
+        classes = (int)bits + 1;
+        this->fmt = fmt;
+        if (fmt == 2)
+            basket_init(&bm);
         block_len = bl;
         in_block = 0;
 
@@ -664,6 +856,31 @@ struct DecChan {
         if (!primed) {
             primed = true;
             in_block = 1;
+            return xh * peak + mean;
+        }
+        if (fmt == 2) {
+            int cl = rc.multi(bm.cnt, classes, bm.tot);
+            int32_t q = 0;
+            if (cl == classes - 1) {
+                int32_t raw = (int32_t)rc.fixed(32);
+                xh = (double)raw / 32768.0;
+                if ((in_block % 2) == 0)
+                    basket_bump(&bm, cl);
+                in_block++;
+                return xh * peak + mean;
+            }
+            if (cl != 0) {
+                int neg = rc.bit(&m.p_sign);
+                uint32_t mag = 1;
+                for (int j = cl - 2; j >= 0; j--)
+                    mag = (mag << 1) | rc.fixed(1);
+                q = neg ? -(int32_t)mag : (int32_t)mag;
+            }
+            if ((in_block % 2) == 0)
+                basket_bump(&bm, cl);
+            double pred = a1 * xh;
+            xh = pred + (double)q * step;
+            in_block++;
             return xh * peak + mean;
         }
         if (block_len != 0 && in_block == block_len) {
@@ -748,7 +965,7 @@ Err acpcm_dec_open(const char* path, AcpcmDecoder** out)
 
     for (size_t c = 0; c < ch && e == ERR_OK; c++)
         e = d->ch[c].init(d->raw[c].data(), d->raw[c].size(), d->info.bits,
-                          d->info.block_len);
+                          d->info.block_len, d->info.format);
 
     if (e != ERR_OK) {
         delete d;

@@ -57,7 +57,7 @@ static Res run(const pcm_buf* in, uint16_t bits, int v2, uint32_t bl,
                acpcm_p2_policy pol, int reps)
 {
     char path[128];
-    snprintf(path, sizeof(path), "/tmp/acp2m_%d.acp", (int)getpid());
+    snprintf(path, sizeof(path), "acp2m_%d.acp", (int)getpid());
 
     Res r;
     memset(&r, 0, sizeof(r));
@@ -77,6 +77,60 @@ static Res run(const pcm_buf* in, uint16_t bits, int v2, uint32_t bl,
             best_e = t1 - t0;
         if (rep == 0)
             r.updates = g_acp2_updates;
+
+        acpcm_info info;
+        memset(&info, 0, sizeof(info));
+        if (acpcm_file_info(path, &info) != ERR_OK || info.frames == 0) {
+            remove(path);
+            return r;
+        }
+        r.bps = 8.0 * (double)info.payload /
+                ((double)info.frames * (double)info.channels);
+
+        pcm_buf out;
+        memset(&out, 0, sizeof(out));
+        double t2 = now_ms();
+        e = acpcm_decode(path, &out);
+        double t3 = now_ms();
+        if (e != ERR_OK) {
+            remove(path);
+            return r;
+        }
+        if (t3 - t2 < best_d)
+            best_d = t3 - t2;
+        if (rep == 0 && out.count == in->count && out.count > 0)
+            r.snr = (double)nofft_decode_snr_db(in->samples, out.samples,
+                                                out.count);
+        pcm_free(&out);
+    }
+
+    remove(path);
+    r.enc_ms = best_e;
+    r.dec_ms = best_d;
+    r.ok = 1;
+    return r;
+}
+
+/* NFA3 path: same timing/SNR protocol, but acpcm_encode3 (no -block). */
+static Res run3(const pcm_buf* in, uint16_t bits, int reps)
+{
+    char path[128];
+    snprintf(path, sizeof(path), "acp2m3_%d.acp", (int)getpid());
+
+    Res r;
+    memset(&r, 0, sizeof(r));
+    double best_e = 1e30, best_d = 1e30;
+
+    for (int rep = 0; rep < reps; rep++) {
+        double t0 = now_ms();
+        Err e = acpcm_encode3(path, in, bits);
+        double t1 = now_ms();
+        if (e != ERR_OK) {
+            remove(path);
+            return r;
+        }
+        if (t1 - t0 < best_e)
+            best_e = t1 - t0;
 
         acpcm_info info;
         memset(&info, 0, sizeof(info));
@@ -305,10 +359,46 @@ static void table_meter(const pcm_buf* in, double drift_bps, long drift_upd)
     printf("\n");
 }
 
+static void table_nfa3_ladder(const pcm_buf* in)
+{
+    printf("T5 NFA3 width ladder, crafted 10 s tone->noise, one predictor\n"
+           "  NFA3 replaces the NFA1 unary run with a basket index coded from an\n"
+           "  adaptive histogram, then the residual mantissa bits; a saturated\n"
+           "  residual escapes to a raw sample.  NFA1 and NFA3 both skip refits.\n"
+           "  delta b/s  NFA3 minus NFA1; negative means the table paid off\n");
+    printf("| bits | NFA1 b/s | NFA1 SNR dB | NFA3 b/s | NFA3 SNR dB"
+           " | NFA3-NFA1 b/s |\n");
+    printf("|---:|---:|---:|---:|---:|---:|\n");
+    for (uint16_t bits = 2; bits <= 12; bits++) {
+        Res v1 = run(in, bits, 0, 0, ACP2_NEVER, 1);
+        Res v3 = run3(in, bits, 1);
+        printf("| %u | %.4f | %.2f | %.4f | %.2f | %+.4f |\n",
+               bits, v1.bps, v1.snr, v3.bps, v3.snr, v3.bps - v1.bps);
+    }
+    printf("\n");
+}
+
+static void table_nfa3(const pcm_buf* sigs[], const char* names[], size_t n)
+{
+    printf("T6 NFA3 signal survey, bits=6, one predictor (no refits)\n"
+           "  delta b/s  NFA3 minus NFA1; negative means the table paid off\n");
+    printf("| signal | frames x ch | NFA1 b/s | NFA1 SNR dB | NFA3 b/s"
+           " | NFA3 SNR dB | NFA3-NFA1 b/s |\n");
+    printf("|---|---:|---:|---:|---:|---:|---:|\n");
+    for (size_t k = 0; k < n; k++) {
+        Res v1 = run(sigs[k], 6, 0, 0, ACP2_NEVER, 1);
+        Res v3 = run3(sigs[k], 6, 1);
+        printf("| %s | %zux%u | %.4f | %.2f | %.4f | %.2f | %+.4f |\n",
+               names[k], sigs[k]->count / sigs[k]->channels, sigs[k]->channels,
+               v1.bps, v1.snr, v3.bps, v3.snr, v3.bps - v1.bps);
+    }
+    printf("\n");
+}
+
 static void table_speed(const pcm_buf* in, const char* name)
 {
     double mframes = (double)(in->count / in->channels) / 1e6;
-    printf("T5 encode/decode wall time, %s (%zu frames x %u ch = %.3f M frames),\n"
+    printf("T7 encode/decode wall time, %s (%zu frames x %u ch = %.3f M frames),\n"
            "  bits=6, block=1024, best of 5 runs; wall time includes writing or\n"
            "  reading the temporary file, throughput is M frames/s (frames, not\n"
            "  samples: stereo counts one frame per L+R pair)\n",
@@ -319,15 +409,18 @@ static void table_speed(const pcm_buf* in, const char* name)
     static const struct {
         const char* name;
         int v2;
+        int v3;
         acpcm_p2_policy pol;
     } vars[] = {
-        { "NFA1 baseline",        0, ACP2_NEVER },
-        { "NFA2 never (flags)",   1, ACP2_NEVER },
-        { "NFA2 always (refit)",  1, ACP2_ALWAYS },
-        { "NFA2 drift (meter)",   1, ACP2_DRIFT },
+        { "NFA1 baseline",        0, 0, ACP2_NEVER },
+        { "NFA2 never (flags)",   1, 0, ACP2_NEVER },
+        { "NFA2 always (refit)",  1, 0, ACP2_ALWAYS },
+        { "NFA2 drift (meter)",   1, 0, ACP2_DRIFT },
+        { "NFA3 baskets",         0, 1, ACP2_NEVER },
     };
     for (size_t i = 0; i < sizeof(vars) / sizeof(vars[0]); i++) {
-        Res r = run(in, 6, vars[i].v2, 1024, vars[i].pol, 5);
+        Res r = vars[i].v3 ? run3(in, 6, 5)
+                           : run(in, 6, vars[i].v2, 1024, vars[i].pol, 5);
         printf("| %s | %.2f | %.2f | %.2f | %.2f |\n",
                vars[i].name, r.enc_ms,
                (double)(in->count / in->channels) / (r.enc_ms / 1000.0) / 1e6,
@@ -362,8 +455,13 @@ int main(void)
     memset(&orig, 0, sizeof(orig));
     int has_orig = (wav_load("orig.wav", &orig) == ERR_OK);
 
-    const pcm_buf* sigs[5];
-    const char* names[5];
+    pcm_buf extra[3];
+    const char* extra_names[3] = { "orig1.wav", "orig16.wav",
+                                   "listen/20_nofade_L32_D6_f16.16.wav" };
+    int have_extra[3] = { 0, 0, 0 };
+
+    const pcm_buf* sigs[8];
+    const char* names[8];
     size_t nsig = 0;
     sigs[nsig] = &crafted; names[nsig++] = "crafted tone->noise";
     sigs[nsig] = &noise;    names[nsig++] = "stationary noise";
@@ -373,7 +471,19 @@ int main(void)
         sigs[nsig] = &orig;
         names[nsig++] = "orig.wav";
     }
+    for (int i = 0; i < 3; i++) {
+        memset(&extra[i], 0, sizeof(extra[i]));
+        if (access(extra_names[i], R_OK) == 0 &&
+            wav_load(extra_names[i], &extra[i]) == ERR_OK &&
+            extra[i].count > 0) {
+            have_extra[i] = 1;
+            sigs[nsig] = &extra[i];
+            names[nsig++] = extra_names[i];
+        }
+    }
     table_signals(sigs, names, nsig);
+    table_nfa3_ladder(&crafted);
+    table_nfa3(sigs, names, nsig);
 
     Res v1 = run(&crafted, 6, 0, 0, ACP2_NEVER, 1);
     Res dr = run(&crafted, 6, 1, 1024, ACP2_DRIFT, 1);
@@ -390,5 +500,8 @@ int main(void)
     pcm_free(&mix);
     if (has_orig)
         pcm_free(&orig);
+    for (int i = 0; i < 3; i++)
+        if (have_extra[i])
+            pcm_free(&extra[i]);
     return 0;
 }

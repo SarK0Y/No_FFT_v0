@@ -34,17 +34,18 @@ static void usage(const char* argv0)
         "  %s play <in.no_fft>                 (WAV to stdout, for piping)\n"
         "\n"
         "acpcm, sample-domain DPCM with a range coder (no polynomial):\n"
-        "  %s ac-encode <in.wav> <out.nadc> [bits] [-snr] [-block N] [-policy never|always|drift]\n"
+        "  %s ac-encode <in.wav> <out.nadc> [bits] [-snr] [-block N] [-policy never|always|drift] [-v3]\n"
         "  %s ac-decode <in.nadc> <out.wav>\n"
         "  %s ac-play <in.nadc>               (WAV to stdout, for piping)\n"
         "  %s ac-info <in.nadc>\n"
-        "  %s ac-roundtrip <in.wav> [bits] [-block N] [-policy never|always|drift]\n"
+        "  %s ac-roundtrip <in.wav> [bits] [-block N] [-policy never|always|drift] [-v3]\n"
         "  %s ac-gen <out.wav> [seconds] [ch] [rate]\n"
         "  %s ac-play-alsa <in.nadc> [-d device]\n"
         "  %s selftest\n"
         "    -block N       write NFA2, refit the predictor every N frames\n"
         "    -policy when   when to refit: never, always or drift (default;\n"
-        "                   needs -block; NFA2 with never still costs flags)\n",
+        "                   needs -block; NFA2 with never still costs flags)\n"
+        "    -v3            write NFA3 (adaptive basket table; no -block)\n",
         argv0, argv0, argv0, argv0, argv0,
         argv0, argv0, argv0, argv0, argv0, argv0, argv0, argv0);
 }
@@ -420,6 +421,7 @@ int main(int argc, char** argv)
         uint32_t block_len = 0;
         acpcm_p2_policy policy = ACP2_DRIFT;
         bool have_policy = false;
+        bool v3 = false;
         bool show_snr = false;
         const char* in = NULL;
         const char* out = NULL;
@@ -427,6 +429,10 @@ int main(int argc, char** argv)
         for (int i = 2; i < argc; i++) {
             if (strcmp(argv[i], "-snr") == 0) {
                 show_snr = true;
+                continue;
+            }
+            if (strcmp(argv[i], "-v3") == 0) {
+                v3 = true;
                 continue;
             }
             if (strcmp(argv[i], "-block") == 0) {
@@ -466,6 +472,10 @@ int main(int argc, char** argv)
             fprintf(stderr, "-policy needs -block\n");
             return 2;
         }
+        if (v3 && (block_len != 0 || have_policy)) {
+            fprintf(stderr, "-v3 cannot be combined with -block or -policy\n");
+            return 2;
+        }
         if (bits < ACPCM_BITS_MIN || bits > ACPCM_BITS_MAX) {
             fprintf(stderr, "bits must be %d..%d\n", ACPCM_BITS_MIN, ACPCM_BITS_MAX);
             return 2;
@@ -477,7 +487,9 @@ int main(int argc, char** argv)
             return 1;
         }
 
-        if (block_len != 0)
+        if (v3)
+            e = acpcm_encode3(out, &pcm, (uint16_t)bits);
+        else if (block_len != 0)
             e = acpcm_encode2(out, &pcm, (uint16_t)bits, block_len, policy);
         else
             e = acpcm_encode(out, &pcm, (uint16_t)bits);
@@ -492,7 +504,9 @@ int main(int argc, char** argv)
                          ((double)info.frames * (double)info.channels);
             char extra[64];
             extra[0] = '\0';
-            if (info.block_len != 0)
+            if (v3)
+                snprintf(extra, sizeof(extra), "  baskets");
+            else if (info.block_len != 0)
                 snprintf(extra, sizeof(extra), "  block=%u policy=%s",
                          info.block_len, policy_str(policy));
             fprintf(stderr,
@@ -614,9 +628,15 @@ int main(int argc, char** argv)
             double bps = 8.0 * (double)info.payload /
                          ((double)info.frames * (double)info.channels);
             char extra[32];
-            extra[0] = '\0';
-            if (info.block_len != 0)
-                snprintf(extra, sizeof(extra), "  block=%u", info.block_len);
+            const char* fname = (info.format == 2) ? "nfa3"
+                              : (info.format == 1) ? "nfa2" : "nfa1";
+            if (info.format == 2)
+                snprintf(extra, sizeof(extra), "  format=%s baskets", fname);
+            else if (info.block_len != 0)
+                snprintf(extra, sizeof(extra), "  format=%s block=%u", fname,
+                         info.block_len);
+            else
+                snprintf(extra, sizeof(extra), "  format=%s", fname);
             fprintf(stderr,
                     "%s  bits=%u  %u ch  %u Hz  %llu frames  %.4f b/sample  %llu bytes%s\n",
                     argv[2], info.bits, info.channels, info.sample_rate,
@@ -634,10 +654,15 @@ int main(int argc, char** argv)
         uint32_t block_len = 0;
         acpcm_p2_policy policy = ACP2_DRIFT;
         bool have_policy = false;
+        bool v3 = false;
         double peak = 0.0;
         const char* in = NULL;
 
         for (int i = 2; i < argc; i++) {
+            if (strcmp(argv[i], "-v3") == 0) {
+                v3 = true;
+                continue;
+            }
             if (strcmp(argv[i], "-block") == 0) {
                 if (i + 1 >= argc) {
                     fprintf(stderr, "-block needs a frame count (>= 1)\n");
@@ -674,6 +699,10 @@ int main(int argc, char** argv)
             fprintf(stderr, "-policy needs -block\n");
             return 2;
         }
+        if (v3 && (block_len != 0 || have_policy)) {
+            fprintf(stderr, "-v3 cannot be combined with -block or -policy\n");
+            return 2;
+        }
         if (bits < ACPCM_BITS_MIN || bits > ACPCM_BITS_MAX) {
             fprintf(stderr, "bits must be %d..%d\n", ACPCM_BITS_MIN, ACPCM_BITS_MAX);
             return 2;
@@ -692,7 +721,9 @@ int main(int argc, char** argv)
             return 1;
         }
 
-        if (block_len != 0)
+        if (v3)
+            e = acpcm_encode3(tmp, &pcm, (uint16_t)bits);
+        else if (block_len != 0)
             e = acpcm_encode2(tmp, &pcm, (uint16_t)bits, block_len, policy);
         else
             e = acpcm_encode(tmp, &pcm, (uint16_t)bits);
@@ -736,7 +767,9 @@ int main(int argc, char** argv)
             {
                 char extra[64];
                 extra[0] = '\0';
-                if (block_len != 0)
+                if (v3)
+                    snprintf(extra, sizeof(extra), "  baskets");
+                else if (block_len != 0)
                     snprintf(extra, sizeof(extra), "  block=%u policy=%s",
                              block_len, policy_str(policy));
                 fprintf(stderr,

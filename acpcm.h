@@ -42,6 +42,18 @@
  * gain for the rest of the chunk.  The encoder decides the flags (policy:
  * never / always / drift); the decoder only obeys.  NFA1 files carry
  * block_len = 0 and no flags, so both formats share one decoder.
+ *
+ * NFA3 (magic "NFA3") is the basket codec: the quality is still one global a1
+ * per chunk, but every frame is split into a coarse symbol i0_b — the basket,
+ * the magnitude class of the residual, 0 for a zero residual — and a fine
+ * symbol i1_r, the remaining mantissa bits.  i0_b is arithmetic coded from a
+ * running int32 histogram of basket counts that both sides update, but only
+ * for the even samples of the chunk (j % 2 == 0), so the model halves its
+ * counting work.  When a residual saturates the quantiser range (|q| = lim, a
+ * transient the predictor cannot reach) the encoder escapes: it sends the
+ * full 32 bit raw sample instead of the huge symbol, and the decoder resumes
+ * the filter from it.  The fixed header is the NFA1 20 byte layout; there is
+ * no block_len, no refit flag and no length-table offset change.
  */
 
 #include <stdint.h>
@@ -51,10 +63,12 @@
 
 #define ACPCM_MAGIC         "NFA1"
 #define ACPCM_MAGIC2        "NFA2"
+#define ACPCM_MAGIC3        "NFA3"
 #define ACPCM_FIXED_HEADER  20
 #define ACPCM_FIXED_HEADER2 24
 #define ACPCM_BITS_MIN      2
 #define ACPCM_BITS_MAX      24
+#define ACPCM_MAX_BASKETS   25   /* classes 0..bits-1 plus the escape class */
 
 /* NFA2: when does the encoder refit a1 at a block boundary?  NEVER keeps the
    stream bit identical to NFA1 (flags all zero); the refit itself is decided
@@ -69,7 +83,8 @@ typedef struct {
     uint16_t bits;       /* quantiser width actually used */
     uint32_t channels;
     uint32_t sample_rate;
-    uint32_t block_len;  /* NFA2 block length in frames, 0 for NFA1 */
+    uint32_t block_len;  /* NFA2 block length in frames, 0 for NFA1/NFA3 */
+    uint8_t  format;     /* 0: NFA1, 1: NFA2, 2: NFA3 */
     uint64_t frames;     /* frames per channel */
     uint64_t payload;    /* bytes of range coded payload */
     uint64_t total;      /* whole file size */
@@ -83,6 +98,10 @@ Err acpcm_encode(const char* path, const pcm_buf* p, uint16_t bits);
    NEVER..DRIFT are rejected with ERR_RANGE. */
 Err acpcm_encode2(const char* path, const pcm_buf* p, uint16_t bits,
                   uint32_t block_len, acpcm_p2_policy policy);
+
+/* NFA3, the basket codec: one global predictor, coarse basket symbol +
+   fine mantissa symbol, adaptive int32 histogram counts. */
+Err acpcm_encode3(const char* path, const pcm_buf* p, uint16_t bits);
 
 Err acpcm_decode(const char* path, pcm_buf* out);
 

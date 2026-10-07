@@ -643,6 +643,143 @@ static void test_drift(int verbose)
     pcm_free(&o2);
 }
 
+/* NFA3: basket coding.  What holds: flat signals stay bit exact, the
+   nonstationary signal keeps its SNR within 2 dB of NFA1, spike transients
+   (which can saturate the residual and take the raw escape path) still decode
+   cleanly, and the file really is an NFA3 container.  The rate table is
+   reported: whether a histogram-coded basket beats the adaptive unary run is
+   the experiment. */
+static void test_baskets(int verbose)
+{
+    const size_t frames = 12000;
+    pcm_buf in, o1, o3;
+    char det[192];
+    double bps1 = 0.0, bps3 = 0.0, snr1 = 0.0, snr3 = 0.0;
+
+    memset(&in, 0, sizeof(in));
+    memset(&o1, 0, sizeof(o1));
+    memset(&o3, 0, sizeof(o3));
+    in.count = frames;
+    in.channels = 1;
+    in.sample_rate = 44100;
+    in.samples = (float*)malloc(in.count * sizeof(float));
+    if (in.samples == NULL)
+        return;
+
+    rng_seed(0xB4A5u);
+    for (size_t i = 0; i < frames; i++) {
+        if (i < frames / 2)
+            in.samples[i] = (float)(0.4 * sin(2.0 * 3.14159265358979 *
+                                              110.0 * (double)i / 44100.0));
+        else
+            in.samples[i] = 0.35f * rng_next();
+    }
+
+    Err e = trip_x(&in, 6, 0, 0, ACP2_NEVER, &o1, &bps1);
+    if (e == ERR_OK) {
+        char path[512];
+        temp_path(path, sizeof(path), "b3");
+        e = acpcm_encode3(path, &in, 6);
+        if (e == ERR_OK) {
+            acpcm_info info;
+            memset(&info, 0, sizeof(info));
+            if (acpcm_file_info(path, &info) == ERR_OK && info.frames != 0) {
+                bps3 = 8.0 * (double)info.payload /
+                       ((double)info.frames * (double)info.channels);
+                snprintf(det, sizeof(det), "format=%u block=%u (want 2 and 0)",
+                         (unsigned)info.format, (unsigned)info.block_len);
+                check(info.format == 2 && info.block_len == 0, verbose,
+                      "nfa3 file reports format 2, block 0", det);
+            }
+            e = acpcm_decode(path, &o3);
+        }
+        remove(path);
+    }
+    if (e != ERR_OK || o1.count != frames || o3.count != frames) {
+        snprintf(det, sizeof(det), "%s", g_err_str(e));
+        check(0, verbose, "nfa3 round trips", det);
+        pcm_free(&in);
+        pcm_free(&o1);
+        pcm_free(&o3);
+        return;
+    }
+    snr1 = (double)nofft_decode_snr_db(in.samples, o1.samples, in.count);
+    snr3 = (double)nofft_decode_snr_db(in.samples, o3.samples, in.count);
+    snprintf(det, sizeof(det), "snr=%.2f dB (v1 %.2f), %.4f b/sample (v1 %.4f)",
+             snr3, snr1, bps3, bps1);
+    check(snr3 >= snr1 - 2.0, verbose, "baskets hold nonstationary quality", det);
+
+    /* flat signals stay exact */
+    {
+        static const float vals[] = { 0.0f, 0.75f };
+        for (size_t k = 0; k < sizeof(vals) / sizeof(vals[0]); k++) {
+            pcm_buf fi, fo;
+            Err fe;
+            memset(&fi, 0, sizeof(fi));
+            memset(&fo, 0, sizeof(fo));
+            fi.count = 4096;
+            fi.channels = 1;
+            fi.sample_rate = 44100;
+            fi.samples = (float*)malloc(fi.count * sizeof(float));
+            if (fi.samples == NULL)
+                break;
+            for (size_t i = 0; i < fi.count; i++)
+                fi.samples[i] = vals[k];
+            char path[512];
+            temp_path(path, sizeof(path), "b3f");
+            fe = acpcm_encode3(path, &fi, 6);
+            if (fe == ERR_OK)
+                fe = acpcm_decode(path, &fo);
+            remove(path);
+            check(fe == ERR_OK && fo.count == fi.count && same(&fi, &fo),
+                  verbose, vals[k] == 0.0f ? "silence exact in baskets"
+                                           : "dc exact in baskets", NULL);
+            pcm_free(&fi);
+            pcm_free(&fo);
+        }
+    }
+
+    /* spike transients: a low floor with sparse loud impulses.  The drops can
+       saturate the residual and take the raw escape path; whichever branch
+       runs, the decode must lose nothing audible. */
+    {
+        pcm_buf si, so;
+        double ssnr;
+        Err fe;
+        memset(&si, 0, sizeof(si));
+        memset(&so, 0, sizeof(so));
+        si.count = frames;
+        si.channels = 1;
+        si.sample_rate = 44100;
+        si.samples = (float*)malloc(si.count * sizeof(float));
+        if (si.samples != NULL) {
+            for (size_t i = 0; i < si.count; i++)
+                si.samples[i] = 0.05f;
+            for (size_t k = 0; k < 8; k++)
+                si.samples[200 + k * 1400] = (k % 2) ? -1.60f : 1.60f;
+            char path[512];
+            temp_path(path, sizeof(path), "b3s");
+            fe = acpcm_encode3(path, &si, 6);
+            if (fe == ERR_OK)
+                fe = acpcm_decode(path, &so);
+            remove(path);
+            ssnr = (fe == ERR_OK && so.count == si.count)
+                       ? (double)nofft_decode_snr_db(si.samples, so.samples,
+                                                     si.count)
+                       : -99.0;
+            snprintf(det, sizeof(det), "snr=%.2f dB", ssnr);
+            check(fe == ERR_OK && so.count == si.count && ssnr >= 30.0,
+                  verbose, "spike transients decode", det);
+            pcm_free(&si);
+            pcm_free(&so);
+        }
+    }
+
+    pcm_free(&in);
+    pcm_free(&o1);
+    pcm_free(&o3);
+}
+
 Err acpcm_selftest(int verbose)
 {
     failures = 0;
@@ -652,6 +789,7 @@ Err acpcm_selftest(int verbose)
     test_no_clipping(verbose);
     test_noise_bound(verbose);
     test_drift(verbose);
+    test_baskets(verbose);
     test_rejects(verbose);
     printf("%s: %d failure(s)\n", failures ? "FAILED" : "passed", failures);
     return failures ? ERR_BAD_ARGS : ERR_OK;

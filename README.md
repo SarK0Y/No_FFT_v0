@@ -304,11 +304,12 @@ endian only, in practice.
 
 The commands above and the rest of this file describe the polynomial codec. The
 `ac-*` commands are a second, independent codec: it keeps **no polynomial at
-all**, and is usually the better choice. Files use the `.nadc` extension and the
-`NFA1` magic, so the two formats never collide and both readers stay simple.
-There is also an experimental `NFA2` variant whose predictor can be refitted
-mid-file, described under "NFA2" below; both magics are read by the same
-decoder.
+all**, and is usually the better choice. Files use the `.nadc` extension —
+**N**o-**F**FT **A**udio **D**PCM **C**odec — with the four byte magic `NFA1`
+(**N**o **F**FT **A**udio codec, format revision 1), so the two formats never
+collide and both readers stay simple. There is also an experimental `NFA2`
+(format revision 2) whose predictor can be refitted mid-file, described under
+"NFA2" below; both magics are read by the same decoder.
 
 ```sh
 nofft ac-roundtrip song.wav 6     # 30.7 dB at 3.03 bits per sample
