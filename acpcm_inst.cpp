@@ -15,6 +15,7 @@ int g_acp2_den = 8;
 int g_acp2_pct = 1;
 long g_acp2_updates = 0;
 
+
 /* ---- LZMA style carryless range coder -------------------------------
  *
  * `low` must be 64 bit.  A carry out of the bound addition lives above bit 31
@@ -267,31 +268,35 @@ int32_t dec_sym(DecCtx* d, SymModel* m)
  * The basket is the coarse half of a two-stage symbol.  q == 0 is basket 0;
  * otherwise basket k is the number of bits of |q| (1..bits-1), so the baskets
  * grow geometrically wider and the common small residuals get the narrowest
- * classes.  The histogram counts what was seen and both sides update it, but
- * only on the even samples of the chunk (j % 2 == 0) so the tally costs half
- * the stream.  totals are halved when they grow past 2^20, which keeps every
- * range-coder product in 64 bits.
+ * classes.  The model is first order: the previous sample's basket selects the
+ * row, so the histogram learns "given the last class, what class comes next" --
+ * the residual class is strongly autocorrelated (a quiet run stays quiet, a
+ * transient is followed by decay).  Both sides update the row on every sample.
+ * A row is halved when its total grows past 2^20, which keeps every range-coder
+ * product in 64 bits.
  */
 struct BasketModel {
-    int32_t cnt[ACPCM_MAX_BASKETS];
-    int64_t tot;
+    int32_t cnt[ACPCM_MAX_BASKETS][ACPCM_MAX_BASKETS];
+    int64_t tot[ACPCM_MAX_BASKETS];
 };
 
 void basket_init(BasketModel* b)
 {
-    for (int i = 0; i < ACPCM_MAX_BASKETS; i++)
-        b->cnt[i] = 0;
-    b->tot = 0;
+    for (int i = 0; i < ACPCM_MAX_BASKETS; i++) {
+        for (int j = 0; j < ACPCM_MAX_BASKETS; j++)
+            b->cnt[i][j] = 0;
+        b->tot[i] = 0;
+    }
 }
 
-void basket_bump(BasketModel* b, int sym)
+void basket_bump(BasketModel* b, int ctx, int sym)
 {
-    b->cnt[sym]++;
-    b->tot++;
-    if (b->tot > (int64_t)(1 << 20)) {
+    b->cnt[ctx][sym]++;
+    b->tot[ctx]++;
+    if (b->tot[ctx] > (int64_t)(1 << 20)) {
         for (int i = 0; i < ACPCM_MAX_BASKETS; i++)
-            b->cnt[i] >>= 1;
-        b->tot >>= 1;
+            b->cnt[ctx][i] >>= 1;
+        b->tot[ctx] >>= 1;
     }
 }
 
@@ -599,6 +604,7 @@ Err encode_chunk3(const float* s, size_t n, const ChanPlan& pl,
     double a1 = pl.a1;
     SymModel z;
     sym_init(&z);
+    int ctx = 0;
 
     for (size_t i = 1; i < n; i++) {
         double src = (s[i] - pl.mean) / pl.peak;
@@ -610,7 +616,7 @@ Err encode_chunk3(const float* s, size_t n, const ChanPlan& pl,
             q = -lim;
 
         int cl = basket_class(q, lim, classes);
-        e.multi(bm.cnt, classes, bm.tot, cl);
+        e.multi(bm.cnt[ctx], classes, bm.tot[ctx], cl);
         if (cl == classes - 1) {
             int32_t raw = quant_clamp(src, 32768.0, -32768.0, 32767.0);
             e.fixed((uint32_t)raw, 32);
@@ -624,8 +630,8 @@ Err encode_chunk3(const float* s, size_t n, const ChanPlan& pl,
             }
             xh = pred + (double)q * pl.step;
         }
-        if ((i % 2) == 0)
-            basket_bump(&bm, cl);
+        basket_bump(&bm, ctx, cl);
+        ctx = cl;
     }
 
     e.done();
@@ -813,6 +819,7 @@ struct DecChan {
     double step;
     int32_t lim;
     int classes;   /* NFA3: basket alphabet size, bits+1 */
+    int ctx;       /* NFA3: previous sample's basket, the histogram row */
     int fmt;       /* 0: NFA1, 1: NFA2, 2: NFA3 */
     bool primed;
     uint32_t block_len;  /* 0: NFA1/NFA3, no flags */
@@ -845,6 +852,7 @@ struct DecChan {
         sym_init(&m);
         classes = (int)bits + 1;
         this->fmt = fmt;
+        ctx = 0;
         if (fmt == 2)
             basket_init(&bm);
         block_len = bl;
@@ -864,13 +872,13 @@ struct DecChan {
             return xh * peak + mean;
         }
         if (fmt == 2) {
-            int cl = rc.multi(bm.cnt, classes, bm.tot);
+            int cl = rc.multi(bm.cnt[ctx], classes, bm.tot[ctx]);
             int32_t q = 0;
             if (cl == classes - 1) {
                 int32_t raw = (int32_t)rc.fixed(32);
                 xh = (double)raw / 32768.0;
-                if ((in_block % 2) == 0)
-                    basket_bump(&bm, cl);
+                basket_bump(&bm, ctx, cl);
+                ctx = cl;
                 in_block++;
                 return xh * peak + mean;
             }
@@ -881,8 +889,8 @@ struct DecChan {
                     mag = (mag << 1) | rc.fixed(1);
                 q = neg ? -(int32_t)mag : (int32_t)mag;
             }
-            if ((in_block % 2) == 0)
-                basket_bump(&bm, cl);
+            basket_bump(&bm, ctx, cl);
+            ctx = cl;
             double pred = a1 * xh;
             xh = pred + (double)q * step;
             in_block++;

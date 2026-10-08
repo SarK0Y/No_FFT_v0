@@ -47,9 +47,8 @@
  * per chunk, but every frame is split into a coarse symbol i0_b — the basket,
  * the magnitude class of the residual, 0 for a zero residual — and a fine
  * symbol i1_r, the remaining mantissa bits.  i0_b is arithmetic coded from a
- * running int32 histogram of basket counts that both sides update, but only
- * for the even samples of the chunk (j % 2 == 0), so the model halves its
- * counting work.  When a residual saturates the quantiser range (|q| = lim, a
+ * running int32 histogram of basket counts that both sides update on every
+ * sample.  When a residual saturates the quantiser range (|q| = lim, a
  * transient the predictor cannot reach) the encoder escapes: it sends the
  * full 32 bit raw sample instead of the huge symbol, and the decoder resumes
  * the filter from it.  The fixed header is the NFA1 20 byte layout; there is
