@@ -1,28 +1,4 @@
-# No_FFT
-
-A lossy audio codec family for `.no_fft` and `.nadc` files. No FFT is involved,
-at any stage.
-
-This README covers **NFA2** only. For the other algorithms, see:
-
-- [NFA1: sample-domain DPCM with a range coder](./docs/nfa1.md)
-- [NFA3: residual baskets](./docs/nfa3.md)
-- [NFA4: basket-only, no predictor](./docs/nfa4.md)
-- [No_FFT: polynomial-fit codec](./docs/nofft.md)
-
-## Build
-
-```sh
-make            # host build -> codecs/linux/ubuntu/{nofft,acc}
-make deb        # Debian package -> build/nofft_<version>_amd64.deb
-make windows    # cross-build win64 (needs mingw-w64)
-make checkver   # assert control/changelog/man agree on the version
-make test       # both self tests, no input files needed
-make check-ac   # prove the C and C++ codecs agree byte for byte
-make clean
-```
-
-## NFA2: forward adaptive predictor (experimental)
+# NFA2: forward adaptive predictor (experimental)
 
 NFA1 fits `a1` once per channel and holds it for the whole file. When the
 material changes character — a quiet passage into percussion, a tone into noise
@@ -32,12 +8,9 @@ did. It is enabled per encode with `-block N` (the refit window in frames) and
 `-policy never|always|drift` (default `drift`; `-policy` needs `-block`):
 
 ```sh
-nofft ac-roundtrip song.wav 6 -block 1024 -policy drift
 nofft ac-encode song.wav song.nadc 6 -block 1024 -policy drift
 nofft ac-roundtrip song.wav 6 -block 1024        # policy defaults to drift
 nofft ac-info song.nadc                          # ... block=1024
-nofft ac-decode song.nadc song.out.wav
-nofft ac-play song.nadc | mpv -
 ```
 
 The library API is `acpcm_encode2` with `acpcm_p2_policy`; the decoder needs
@@ -45,10 +18,8 @@ nothing new and reads both magics. `ac-info` and the encoder/roundtrip summary
 echo `block=` and `policy=` so a stream's shape is visible without a hex
 editor.
 
-### Container
-
-Magic `NFA2`, and the fixed header gains one field, so the length table starts
-at 24 instead of 20:
+Container: magic `NFA2`, and the fixed header gains one field, so the length
+table starts at 24 instead of 20:
 
     0   char     magic[4]   "NFA2"
     4   uint32   frames     frames per channel
@@ -88,7 +59,7 @@ expensive, the next boundary refits. That is a magnitude meter, so on stable
 material it senses busy blocks rather than a wrong predictor and fires more
 often than it needs to — the cost is still small.
 
-Measured at `bits=6`, `block_len=1024` (`./measure_acp2`):
+Measured at `bits=6`, `block_len=1024` (`./measure_acp2`, see Layout):
 
 | Material | NFA1 bits/sample | NFA2 drift bits/sample | change | NFA1 SNR | NFA2 drift SNR |
 | --- | --- | --- | --- | --- | --- |
@@ -113,21 +84,3 @@ g++ -std=c++17 -O2 -Wall -Wextra -Werror -pedantic \
     -o measure_acp2 measure_acp2.cpp acpcm_inst.cpp nofft.cpp -lm
 ./measure_acp2
 ```
-
-## Links:  
-
-**Rolling guide of TAM:** [https://alg0z8n8its9lovely6tricks.blogspot.com/2024/08/tam-guide-of-features-smart-tricks.html](https://alg0z8n8its9lovely6tricks.blogspot.com/2024/08/tam-guide-of-features-smart-tricks.html)  
-**TELEGRAM:** [https://t.me/+N\_TdOq7Ui2ZiOTM6](https://t.me/+N_TdOq7Ui2ZiOTM6) (Alg0Z).  
-**ALG0Z RU:** [https://dzen.ru/alg0z](https://dzen.ru/alg0z)  
-**ALG0Z EN:** [https://alg0z.blogspot.com](https://alg0z.blogspot.com)  
-**ChangeLog:** [https://alg0z8n8its9lovely6tricks.blogspot.com/2023/09/tam-changelog.html](https://alg0z8n8its9lovely6tricks.blogspot.com/2023/09/tam-changelog.html)  
-**FORUM:** [https://www.neowin.net/forum/topic/1430114-tam/](https://www.neowin.net/forum/topic/1430114-tam/)  
-**E-MAIL:** [sark0y@protonmail.com](mailto:sark0y@protonmail.com)  
-**GITHUB:** [https://github.com/SarK0Y/TAM\_RUSTy.git](https://github.com/SarK0Y/TAM_RUSTy.git)  
-**YouTube:** [https://www.youtube.com/@evgeneyknyazhev968](https://www.youtube.com/@evgeneyknyazhev968)  
-**Twitter\_X:** [https://x.com/SarK0Y8](https://x.com/SarK0Y8)  
-Donations: [https://boosty.to/alg0z/donate](https://boosty.to/alg0z/donate) [https://zap-hosting.com/en/shop/donation/1f0c83845d810df04ca74e56238399f7/](https://zap-hosting.com/en/shop/donation/1f0c83845d810df04ca74e56238399f7/)  
-
-# Project has been assisted w/ awesome OpenCode 🙂
-
-# my the Best Wishes to You 🙃
