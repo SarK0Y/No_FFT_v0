@@ -53,6 +53,15 @@
  * full 32 bit raw sample instead of the huge symbol, and the decoder resumes
  * the filter from it.  The fixed header is the NFA1 20 byte layout; there is
  * no block_len, no refit flag and no length-table offset change.
+ *
+ * NFA4 (magic "NFA4") is basket-only: no predictor and no residual, one symbol
+ * per sample.  The header carries the shifted-grid range peak_q and the channel
+ * minimum base_q; every sample maps to u = xq - base_q and is floored onto a
+ * `step` percent grid of peak_q: i_b = floor(u * 100 / (peak_q * step)).  The
+ * basket table is transmitted once per chunk as [count: int32 | edge: float16]
+ * rows.  The decoder rebuilds the bucket midpoint and returns
+ * (base_q + mid) / 32768.  A flat channel has peak_q == 0 and decodes exactly.
+ * The fixed header is the NFA1 20 byte layout (format 3, block_len 0).
  */
 
 #include <stdint.h>
@@ -63,11 +72,17 @@
 #define ACPCM_MAGIC         "NFA1"
 #define ACPCM_MAGIC2        "NFA2"
 #define ACPCM_MAGIC3        "NFA3"
+#define ACPCM_MAGIC4        "NFA4"
 #define ACPCM_FIXED_HEADER  20
 #define ACPCM_FIXED_HEADER2 24
 #define ACPCM_BITS_MIN      2
 #define ACPCM_BITS_MAX      24
 #define ACPCM_MAX_BASKETS   25   /* classes 0..bits-1 plus the escape class */
+/* NFA4: basket grid of `step` percent of the channel range; the shifted index
+   stays under 100/step.  256 is a safety bound. */
+#define ACPCM4_MAX_BUCKETS  256
+#define ACPCM4_STEP_MIN     1
+#define ACPCM4_STEP_MAX     65535
 
 /* NFA2: when does the encoder refit a1 at a block boundary?  NEVER keeps the
    stream bit identical to NFA1 (flags all zero); the refit itself is decided
@@ -82,8 +97,8 @@ typedef struct {
     uint16_t bits;       /* quantiser width actually used */
     uint32_t channels;
     uint32_t sample_rate;
-    uint32_t block_len;  /* NFA2 block length in frames, 0 for NFA1/NFA3 */
-    uint8_t  format;     /* 0: NFA1, 1: NFA2, 2: NFA3 */
+    uint32_t block_len;  /* NFA2 block length in frames, 0 for NFA1/NFA3/NFA4 */
+    uint8_t  format;     /* 0: NFA1, 1: NFA2, 2: NFA3, 3: NFA4 */
     uint64_t frames;     /* frames per channel */
     uint64_t payload;    /* bytes of range coded payload */
     uint64_t total;      /* whole file size */
@@ -101,6 +116,17 @@ Err acpcm_encode2(const char* path, const pcm_buf* p, uint16_t bits,
 /* NFA3, the basket codec: one global predictor, coarse basket symbol +
    fine mantissa symbol, adaptive int32 histogram counts. */
 Err acpcm_encode3(const char* path, const pcm_buf* p, uint16_t bits);
+
+/* NFA4, the basket-only codec: the channel is shifted so its minimum is at
+   zero (base_q), and every sample carries one basket index
+   i_b = floor((xq - base_q) * 100 / (peak_q * step)) on a `step` percent grid
+   of the shifted range.  The decoder rebuilds the bucket midpoint and adds
+   base_q back; there is no predictor and no residual.  The transmitted table is
+   [count, edge_k*step] (percent of range).  `bits` is stored for the header but
+   does not affect the grid.  `step` outside ACPCM4_STEP_MIN..ACPCM4_STEP_MAX is
+   rejected with ERR_RANGE. */
+Err acpcm_encode4(const char* path, const pcm_buf* p, uint16_t bits,
+                  uint32_t step);
 
 Err acpcm_decode(const char* path, pcm_buf* out);
 

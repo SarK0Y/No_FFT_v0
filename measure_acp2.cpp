@@ -20,6 +20,7 @@
 extern int g_acp2_den;
 extern int g_acp2_pct;
 extern long g_acp2_updates;
+extern long g_acp4_baskets;
 
 static uint32_t rng_state;
 
@@ -124,6 +125,64 @@ static Res run3(const pcm_buf* in, uint16_t bits, int reps)
     for (int rep = 0; rep < reps; rep++) {
         double t0 = now_ms();
         Err e = acpcm_encode3(path, in, bits);
+        double t1 = now_ms();
+        if (e != ERR_OK) {
+            remove(path);
+            return r;
+        }
+        if (t1 - t0 < best_e)
+            best_e = t1 - t0;
+
+        acpcm_info info;
+        memset(&info, 0, sizeof(info));
+        if (acpcm_file_info(path, &info) != ERR_OK || info.frames == 0) {
+            remove(path);
+            return r;
+        }
+        r.bps = 8.0 * (double)info.payload /
+                ((double)info.frames * (double)info.channels);
+
+        pcm_buf out;
+        memset(&out, 0, sizeof(out));
+        double t2 = now_ms();
+        e = acpcm_decode(path, &out);
+        double t3 = now_ms();
+        if (e != ERR_OK) {
+            remove(path);
+            return r;
+        }
+        if (t3 - t2 < best_d)
+            best_d = t3 - t2;
+        if (rep == 0 && out.count == in->count && out.count > 0)
+            r.snr = (double)nofft_decode_snr_db(in->samples, out.samples,
+                                                out.count);
+        pcm_free(&out);
+    }
+
+    remove(path);
+    r.enc_ms = best_e;
+    r.dec_ms = best_d;
+    r.ok = 1;
+    return r;
+}
+
+/* NFA4 path: the basket-only codec.  The channel is shifted so its minimum
+   sits at zero, then every sample is coded as one basket index on a `step`
+   percent grid of the shifted range; there is no predictor and no residual.
+   The bits argument is kept for the file header but does not affect the grid;
+   step sets the bucket width. */
+static Res run4(const pcm_buf* in, uint16_t bits, uint32_t step, int reps)
+{
+    char path[128];
+    snprintf(path, sizeof(path), "acp2m4_%d.acp", (int)getpid());
+
+    Res r;
+    memset(&r, 0, sizeof(r));
+    double best_e = 1e30, best_d = 1e30;
+
+    for (int rep = 0; rep < reps; rep++) {
+        double t0 = now_ms();
+        Err e = acpcm_encode4(path, in, bits, step);
         double t1 = now_ms();
         if (e != ERR_OK) {
             remove(path);
@@ -395,6 +454,74 @@ static void table_nfa3(const pcm_buf* sigs[], const char* names[], size_t n)
     printf("\n");
 }
 
+static void table_nfa4_ladder(const pcm_buf* in)
+{
+    printf("T8 NFA4 width ladder, crafted 10 s tone->noise, step=5 percent\n"
+           "  NFA4 is basket-only: one basket index per sample on a step-percent\n"
+           "  grid of the shifted channel range.  It ignores the residual width,\n"
+           "  so the NFA4 columns stay flat down the bits column while NFA1/NFA3\n"
+           "  get finer.  Step is the bucket width in percent of channel range.\n");
+    printf("| bits | NFA1 b/s | NFA3 b/s | NFA4 b/s | NFA4 SNR dB"
+           " | NFA4-NFA3 b/s |\n");
+    printf("|---:|---:|---:|---:|---:|---:|\n");
+    for (uint16_t bits = 2; bits <= 12; bits++) {
+        Res v1 = run(in, bits, 0, 0, ACP2_NEVER, 1);
+        Res v3 = run3(in, bits, 1);
+        Res v4 = run4(in, bits, 5, 1);
+        printf("| %u | %.4f | %.4f | %.4f | %.2f | %+.4f |\n",
+               bits, v1.bps, v3.bps, v4.bps, v4.snr, v4.bps - v3.bps);
+    }
+    printf("\n");
+}
+
+static void table_nfa4(const pcm_buf* sigs[], const char* names[], size_t n)
+{
+    printf("T9 NFA4 signal survey, bits=8, step=5 percent\n"
+           "  NFA4 is basket-only (no predictor, no residual); NFA3 is the\n"
+           "  predictive codec at the same residual width.  NFA4 trades the\n"
+           "  whole bitstream for one basket symbol per sample, so at a good step\n"
+           "  it is far below NFA3 in rate but also lower in SNR.\n");
+    printf("| signal | frames x ch | NFA3 b/s | NFA4 b/s | NFA4 SNR dB"
+           " | NFA4-NFA3 b/s |\n");
+    printf("|---|---:|---:|---:|---:|---:|\n");
+    for (size_t k = 0; k < n; k++) {
+        Res v3 = run3(sigs[k], 8, 1);
+        Res v4 = run4(sigs[k], 8, 5, 1);
+        printf("| %s | %zux%u | %.4f | %.4f | %.2f | %+.4f |\n",
+               names[k], sigs[k]->count / sigs[k]->channels, sigs[k]->channels,
+               v3.bps, v4.bps, v4.snr, v4.bps - v3.bps);
+    }
+    printf("\n");
+}
+
+static void table_nfa4_baskets(const pcm_buf* sigs[], const char* names[],
+                               size_t n)
+{
+    /* Target basket counts; the grid step is derived from the count:
+       step = floor(100/baskets)+1 gives exactly `baskets` rows for any
+       non-flat channel, since the range maps to floor(100/step) buckets. */
+    static const uint32_t want[] = { 2, 3, 4, 5, 6, 8, 11, 16, 21, 26, 34,
+                                     51, 101 };
+    printf("T10 NFA4 rate and fidelity by basket count, bits=8\n"
+           "  baskets is the number of transmitted table rows (nb), so the\n"
+           "  per-sample basket symbol costs about log2(baskets) bits; step is\n"
+           "  the grid percent derived from the count.  A flat channel reports\n"
+           "  baskets=1 regardless (its range is zero).\n");
+    for (size_t k = 0; k < n; k++) {
+        printf("  %s (%zux%u)\n", names[k],
+               sigs[k]->count / sigs[k]->channels, sigs[k]->channels);
+        printf("| baskets | step | NFA4 b/s | NFA4 SNR dB |\n"
+               "|---:|---:|---:|---:|\n");
+        for (size_t j = 0; j < sizeof(want) / sizeof(want[0]); j++) {
+            uint32_t step = (uint32_t)(100u / want[j]) + 1u;
+            Res v4 = run4(sigs[k], 8, step, 1);
+            printf("| %ld | %u | %.4f | %.2f |\n",
+                   g_acp4_baskets, step, v4.bps, v4.snr);
+        }
+    }
+    printf("\n");
+}
+
 static void table_speed(const pcm_buf* in, const char* name)
 {
     double mframes = (double)(in->count / in->channels) / 1e6;
@@ -410,17 +537,21 @@ static void table_speed(const pcm_buf* in, const char* name)
         const char* name;
         int v2;
         int v3;
+        int v4;
         acpcm_p2_policy pol;
     } vars[] = {
-        { "NFA1 baseline",        0, 0, ACP2_NEVER },
-        { "NFA2 never (flags)",   1, 0, ACP2_NEVER },
-        { "NFA2 always (refit)",  1, 0, ACP2_ALWAYS },
-        { "NFA2 drift (meter)",   1, 0, ACP2_DRIFT },
-        { "NFA3 baskets",         0, 1, ACP2_NEVER },
+        { "NFA1 baseline",        0, 0, 0, ACP2_NEVER },
+        { "NFA2 never (flags)",   1, 0, 0, ACP2_NEVER },
+        { "NFA2 always (refit)",  1, 0, 0, ACP2_ALWAYS },
+        { "NFA2 drift (meter)",   1, 0, 0, ACP2_DRIFT },
+        { "NFA3 baskets",         0, 1, 0, ACP2_NEVER },
+        { "NFA4 baskets",         0, 0, 1, ACP2_NEVER },
     };
     for (size_t i = 0; i < sizeof(vars) / sizeof(vars[0]); i++) {
         Res r = vars[i].v3 ? run3(in, 6, 5)
-                           : run(in, 6, vars[i].v2, 1024, vars[i].pol, 5);
+                           : vars[i].v4 ? run4(in, 6, 5, 5)
+                                        : run(in, 6, vars[i].v2, 1024,
+                                              vars[i].pol, 5);
         printf("| %s | %.2f | %.2f | %.2f | %.2f |\n",
                vars[i].name, r.enc_ms,
                (double)(in->count / in->channels) / (r.enc_ms / 1000.0) / 1e6,
@@ -430,8 +561,28 @@ static void table_speed(const pcm_buf* in, const char* name)
     printf("\n");
 }
 
-int main(void)
+int main(int argc, char** argv)
 {
+    if (argc > 1 && strcmp(argv[1], "nfa4-baskets") == 0) {
+        pcm_buf c = sig_crafted(441000);
+        pcm_buf o, o1;
+        memset(&o, 0, sizeof(o));
+        memset(&o1, 0, sizeof(o1));
+        int ho = (wav_load("orig.wav", &o) == ERR_OK);
+        int ho1 = (wav_load("orig1.wav", &o1) == ERR_OK);
+        const pcm_buf* s[4];
+        const char* nm[4];
+        size_t ns = 0;
+        if (c.samples != NULL) { s[ns] = &c; nm[ns++] = "crafted tone->noise"; }
+        if (ho) { s[ns] = &o; nm[ns++] = "orig.wav"; }
+        if (ho1) { s[ns] = &o1; nm[ns++] = "orig1.wav"; }
+        table_nfa4_baskets(s, nm, ns);
+        pcm_free(&c);
+        if (ho) pcm_free(&o);
+        if (ho1) pcm_free(&o1);
+        return 0;
+    }
+
     printf("acpcm NFA2 measurement\n"
            "  NFA1 = existing format, one global predictor for the whole file\n"
            "  NFA2 = new format, predictor gain a1 can be replaced at block edges\n"
@@ -484,6 +635,8 @@ int main(void)
     table_signals(sigs, names, nsig);
     table_nfa3_ladder(&crafted);
     table_nfa3(sigs, names, nsig);
+    table_nfa4_ladder(&crafted);
+    table_nfa4(sigs, names, nsig);
 
     Res v1 = run(&crafted, 6, 0, 0, ACP2_NEVER, 1);
     Res dr = run(&crafted, 6, 1, 1024, ACP2_DRIFT, 1);

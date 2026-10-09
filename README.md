@@ -48,9 +48,9 @@ nofft roundtrip <in.wav>              [frame_len] [degree] [f32|f16] [interp|lea
 nofft convert  <in.mp3> <out.no.fft>  [frame_len] [degree] [f32|f16] [interp|least-sq]
 nofft play     <in.no.fft>
 
-nofft ac-encode   <in.wav> <out.nadc> [bits] [-snr] [-block N] [-policy never|always|drift]
+nofft ac-encode   <in.wav> <out.nadc> [bits] [-snr] [-block N] [-policy never|always|drift] [-v3] [-v4 -s N]
 nofft ac-decode   <in.nadc> <out.wav>
-nofft ac-roundtrip <in.wav>            [bits] [-block N] [-policy never|always|drift]
+nofft ac-roundtrip <in.wav>            [bits] [-block N] [-policy never|always|drift] [-v3] [-v4 -s N]
 nofft ac-info     <in.nadc>
 nofft ac-play     <in.nadc>
 nofft selftest
@@ -308,13 +308,16 @@ all**, and is usually the better choice. Files use the `.nadc` extension —
 **N**o-**F**FT **A**udio **D**PCM **C**odec — with the four byte magic `NFA1`
 (**N**o **F**FT **A**udio codec, format revision 1), so the two formats never
 collide and both readers stay simple. There is also an experimental `NFA2`
-(format revision 2) whose predictor can be refitted mid-file, described under
-"NFA2" below; both magics are read by the same decoder.
+(format revision 2, predictor refitted mid-file), `NFA3` (residual baskets),
+and `NFA4` (basket-only, no predictor), described under the headings
+below; all four magics are read by the same decoder.
 
 ```sh
 nofft ac-roundtrip song.wav 6     # 30.7 dB at 3.03 bits per sample
 nofft ac-encode song.wav song.nadc 6
 nofft ac-roundtrip song.wav 6 -block 1024 -policy drift   # NFA2 refits
+nofft ac-roundtrip song.wav 6 -v3                        # NFA3 baskets
+nofft ac-roundtrip song.wav 8 -v4 -s 5                   # NFA4 baskets (no predictor)
 nofft ac-decode song.nadc song.out.wav
 nofft ac-play song.nadc | mpv -
 ```
@@ -482,6 +485,134 @@ g++ -std=c++17 -O2 -Wall -Wextra -Werror -pedantic \
 ./measure_acp2
 ```
 
+### NFA3: residual baskets (experimental)
+
+NFA1 codes each residual as a unary run (exponent) plus the fixed `bits`
+mantissa. When `bits` is large the mantissa is most of the transfer, but the
+unary run still spends 2-3 bits on the exponent's tail. NFA3 keeps the NFA1
+predictor, quantiser, and chunk header exactly as they are and replaces the
+unary run with a **basket index** coded from an adaptive histogram; the
+mantissa is unchanged. It is enabled with `-v3` (or `acpcm_encode3`) and is the
+simpler of the extra formats: no blocks, no refits, one predictor fit for the
+whole file.
+
+The histogram is a first-order context machine: `classes = bits + 1` bins per
+row and the same number of rows, keyed by the *previous* basket. A row is
+updated after every sample and its counts are halved in scale once the row
+total passes 2^20, so the statistics stay agile without a tuning constant.
+The bins cover the residual's entire symbol range, but a residual that leaves
+the finely measured region can saturate the last bin; when that happens the
+encoder emits the last index as an escape followed by the raw 32-bit sample.
+
+Container magic is `NFA3`; the fixed header and each chunk header are
+bit-identical to NFA1. Only the per-sample symbol changes, which makes it an
+easy thing to measure in isolation:
+
+```sh
+nofft ac-encode song.wav song.nadc 6 -v3
+nofft ac-roundtrip song.wav 6 -v3
+nofft ac-info song.nadc                          # ... format=nfa3 baskets
+```
+
+Measured at `bits=6`, one predictor, no refits (`./measure_acp2`):
+
+| Material | NFA1 b/s | NFA3 b/s | NFA3-NFA1 | NFA1 SNR | NFA3 SNR |
+| --- | --- | --- | --- | --- | --- |
+| crafted tone->noise, 10 s | 4.3855 | 4.4692 | +0.084 | 36.44 dB | 36.44 dB |
+| stationary noise, 10 s | 6.0631 | 5.9873 | -0.076 | 35.54 dB | 35.54 dB |
+| stationary tone 440, 10 s | 5.8982 | 4.8365 | **-1.062** | 61.39 dB | 61.39 dB |
+| tones + noise, 10 s | 5.5816 | 5.5117 | -0.070 | 40.23 dB | 40.23 dB |
+| real stereo track (orig.wav) | 3.2070 | 3.2807 | +0.074 | 31.22 dB | 31.22 dB |
+| real stereo track (orig1.wav) | 2.3570 | 2.5430 | +0.186 | 25.46 dB | 25.46 dB |
+| listen track, 10.4 M frames | 2.0601 | 1.9921 | -0.068 | 27.91 dB | 27.91 dB |
+
+The width ladder (same crafted signal) shows the effect growing with `bits`:
+NFA3 beats NFA1 by -0.083 b/s at `bits=7`, -0.223 at `bits=8`, ... -0.413 at
+`bits=12`, while SNR is identical at every width (the residual mantissa is
+unchanged). Below `bits=6` the table costs a few tenths of a bit instead:
+at `bits=4` +0.242, `bits=3` +0.079, and at `bits=2` the escape fires often
+enough to cost +1.078. So NFA3 is a pure refinement: same predictor, same
+quality, and on narrow (tone-like) residuals it buys back the unary run.
+
+### NFA4: basket-only, no predictor (experimental)
+
+NFA3 asks "is the mantissa-shaped unary run worth replacing?" NFA4 goes the
+other way and asks how far one transmitted histogram can get *without* any
+predictor or residual at all. Every sample carries exactly one symbol: its
+basket index. There is no `a1` filter, no seed sample, no residual.
+
+A basket index alone is a magnitude class, so to avoid a sign symbol the channel
+grid is shifted first. The header carries the channel minimum `base_q`; every
+sample maps to `u = xq - base_q >= 0`, and the decoder adds `base_q` back. On
+that shifted grid `u` is floored onto a `step`-percent grid of the channel range
+`peak_q`:
+
+    b = floor(u * 100 / (peak_q * step))
+
+The transmitted codebook is one `[count: 32-bit | deviation: 16-bit float]` row
+per basket (the `float16` column is an upper edge, carried and validated but
+never used in the arithmetic). The decoder rebuilds the bucket midpoint
+
+    mid_b = (ceil(b*peak_q*step/100) + ceil((b+1)*peak_q*step/100)) / 2
+
+and returns `(base_q + mid_b) / 32768`. A flat or silent channel has `peak_q
+== 0`, so every sample lands in bucket 0 whose midpoint is 0 and the output is
+`base_q` exactly: silence and DC round-trip bit for bit.
+
+Although the header keeps the `bits` byte for compatibility, the basket grid is
+set entirely by `step`; the residual width does not enter (T8 shows the NFA4
+columns flat down the `bits` ladder).
+
+Enabled with `-v4 -s step`, where `step` is the bucket width in percent of the
+channel range (`-s` needs `-v4`; defaults to `-s 5`):
+
+```sh
+nofft ac-encode song.wav song.nadc 8 -v4 -s 5
+nofft ac-roundtrip song.wav 8 -v4 -s 5
+nofft ac-info song.nadc                          # ... format=nfa4 baskets
+```
+
+The fixed header is the NFA1 20-byte layout (format 3, `block_len` 0); there is
+no refit. `step` is the whole quality-per-rate knob: a finer grid (`-s 1`) gives
+101 baskets and near-`bits=5` quality, a coarse one (`-s 20`) gives 6 baskets at
+a fraction of the rate.
+
+Measured at `bits=8`, `step=5` (`./measure_acp2`, T8/T9):
+
+| Material | NFA3 b/s | NFA4 b/s | NFA4-NFA3 | NFA4 SNR | NFA3 SNR |
+| --- | --- | --- | --- | --- | --- |
+| crafted tone->noise, 10 s | 6.1709 | 4.1608 | -2.010 | 25.00 dB | 36.44 dB |
+| stationary noise, 10 s | 8.0067 | 4.3244 | -3.682 | 26.02 dB | 35.54 dB |
+| stationary tone 440, 10 s | 6.8084 | 4.1230 | -2.685 | 27.31 dB | 61.39 dB |
+| tones + noise, 10 s | 7.5691 | 4.1126 | -3.457 | 23.50 dB | 40.23 dB |
+| real stereo track (orig.wav) | 5.2790 | 3.0458 | -2.233 | 17.19 dB | 31.22 dB |
+| real stereo track (orig1.wav) | 4.3936 | 2.8034 | -1.590 | 16.14 dB | 25.46 dB |
+| listen track, 10.4 M frames | 3.5443 | 3.0406 | **-0.504** | 17.16 dB | 27.91 dB |
+
+Dropping the predictor costs a lot of fidelity but buys a lot of rate: at
+`step=5` NFA4 runs 1.6-3.7 b/s below NFA3 on real material, at roughly the
+quality of a low-bit NFA1. The `step` sweep on `orig.wav` (T10) makes the
+trade explicit:
+
+| step | baskets | NFA4 b/s | NFA4 SNR |
+| ---: | ---: | --- | --- |
+| 1 | 101 | 5.3345 | 31.27 dB |
+| 2 | 51 | 4.3412 | 25.21 dB |
+| 5 | 21 | 3.0458 | 17.19 dB |
+| 10 | 11 | 2.1260 | 10.97 dB |
+| 20 | 6 | 1.1955 | 6.17 dB |
+
+The basket count is `floor(100/step) + 1`, and the per-sample symbol costs about
+`log2(baskets)` bits, so `step` moves rate and fidelity together. This is a
+deliberately simple, predictor-free codec: one histogram, one symbol per sample.
+
+
+Speed pays for the second symbol. Decoding drops to about 3.1 M frames/s on the
+crafted mono signal and 2.5 on the stereo track (NFA1: 16.2 and 9.3; NFA3: 6.8
+and 4.2), i.e. roughly half NFA3's throughput; encoding is about 2x NFA3's,
+because every sample now runs both the residual symbol and a multi-bin table
+look-up.
+
 ### Limits worth knowing
 
 - **Input range.** The header fields are 16-bit fixed point over a nominal
@@ -531,7 +662,9 @@ previous behaviour.
 
 `acpcm.h` is the second codec, usable the same way: `acpcm_encode`,
 `acpcm_decode`, `acpcm_file_info` and `acpcm_info`; `acpcm_encode2` and
-`acpcm_p2_policy` add the experimental NFA2 refit policies.
+`acpcm_p2_policy` add the experimental NFA2 refit policies, `acpcm_encode3`
+the NFA3 residual basket codec, and `acpcm_encode4` the NFA4 basket-only codec
+(which also takes the `step` bucket width).
 
 The polynomial codec is C++ written in a C style: no classes, no STL containers,
 no exceptions, manual allocation, `enum Err` returns. Buffers are freed with
@@ -571,6 +704,15 @@ nonstationary signal must hold its SNR within 2 dB of NFA1 under every policy,
 and a `block_len` of 0 — in the argument or patched into a written header — is
 rejected rather than misparsed.
 
+NFA3 and NFA4 get the same treatment: NFA3 round-trips a nonstationary signal
+at `bits=6` within 2 dB of NFA1's SNR, keeps silence and DC bit-exact, survives
+loud spike transients through the raw-escape path (SNR >= 30 dB), and reports
+`format=2, block=0`; NFA4 codes a basket grid whose finer step strictly beats a
+coarser one on the same signal, round-trips silence and DC *exactly* (a flat
+channel has `peak_q == 0`, so every sample lands in bucket 0 whose midpoint is
+0), codes an off-centre channel with sparse dips, and rejects `step` out of
+range and a zero `bits` before any file is written.
+
 The C build is checked against the C++ one rather than only against itself:
 `make check-ac` generates a stereo test signal, encodes it with both tools at
 every width from 2 to 24, and requires the files to be byte identical, then
@@ -599,7 +741,7 @@ acpcm.cpp       range coder, DPCM analyser and encoder, NFA1 container
 acpcm.h         public API for the acpcm codec
 selftest.cpp    built-in checks behind `nofft selftest`
 selftest.h      self-test entry point
-measure_acp2.cpp  scratch harness: NFA2 rate/SNR/speed/meter tables (not in `make`)
+measure_acp2.cpp  scratch harness: NFA1/2/3/4 rate, SNR, speed, meter tables (not in `make`)
 acpcm_inst.cpp  copy of acpcm.cpp with refit counters, for measure_acp2 (not in `make`)
 c/ac.h          public API for the C acpcm codec
 c/main.c        `acc` CLI, including its self test
@@ -629,5 +771,6 @@ use on little-endian machines.
 
 The acpcm codec in `NFA1` is implemented twice, in C++ and in C, and `make
 check-ac` keeps the two honest by comparing them byte for byte at every bit
-width. The C++ copy remains the reference. `NFA2` is experimental and C++
-only: neither the C port nor `make check-ac` covers it.
+width. The C++ copy remains the reference. `NFA2`, `NFA3`, and `NFA4` are
+experimental and C++ only: neither the C port nor `make check-ac` covers
+them.

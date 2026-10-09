@@ -780,6 +780,164 @@ static void test_baskets(int verbose)
     pcm_free(&o3);
 }
 
+/* NFA4: the basket-only codec.  Everything must round trip: the shifted grid
+   and the transmitted basket table are the whole stream.  A finer step must
+   beat a coarser one on the same signal, and a flat channel (peak_q == 0) has
+   every sample in bucket 0 whose midpoint is 0, so silence and DC stay exact. */
+static void test_nfa4(int verbose)
+{
+    const size_t frames = 12000;
+    pcm_buf in, o4;
+    char det[192];
+    double bps4 = 0.0, snr4 = 0.0;
+
+    memset(&in, 0, sizeof(in));
+    memset(&o4, 0, sizeof(o4));
+    in.count = frames * 2;          /* stereo, exercises per-channel tables */
+    in.channels = 2;
+    in.sample_rate = 44100;
+    in.samples = (float*)malloc(in.count * sizeof(float));
+    if (in.samples == NULL)
+        return;
+
+    rng_seed(0xC41Du);
+    for (size_t i = 0; i < frames; i++) {
+        in.samples[2 * i + 0] = (float)(0.6 * sin(2.0 * 3.14159265358979 *
+                                                  440.0 * (double)i / 44100.0));
+        in.samples[2 * i + 1] = 0.3f * rng_next();
+    }
+
+    char path[512];
+    temp_path(path, sizeof(path), "n4");
+    Err e = acpcm_encode4(path, &in, 16, 5);
+    if (e == ERR_OK) {
+        acpcm_info info;
+        memset(&info, 0, sizeof(info));
+        if (acpcm_file_info(path, &info) == ERR_OK && info.frames != 0) {
+            bps4 = 8.0 * (double)info.payload /
+                   ((double)info.frames * (double)info.channels);
+            snprintf(det, sizeof(det), "format=%u block=%u (want 3 and 0)",
+                     (unsigned)info.format, (unsigned)info.block_len);
+            check(info.format == 3 && info.block_len == 0, verbose,
+                  "nfa4 file reports format 3, block 0", det);
+        }
+        e = acpcm_decode(path, &o4);
+    }
+    if (e != ERR_OK || o4.count != in.count) {
+        snprintf(det, sizeof(det), "%s", g_err_str(e));
+        check(0, verbose, "nfa4 round trips", det);
+        pcm_free(&in);
+        pcm_free(&o4);
+        return;
+    }
+    snr4 = (double)nofft_decode_snr_db(in.samples, o4.samples, in.count);
+    snprintf(det, sizeof(det), "snr=%.2f dB, %.4f b/sample", snr4, bps4);
+    check(snr4 >= 12.0, verbose, "nfa4 codes the basket grid", det);
+
+    /* a finer basket grid must beat a coarser one on the same signal */
+    {
+        pcm_buf fine, coarse;
+        double snr_fine = -99.0, snr_coarse = -99.0;
+        char p1[512], p2[512];
+        memset(&fine, 0, sizeof(fine));
+        memset(&coarse, 0, sizeof(coarse));
+        temp_path(p1, sizeof(p1), "n4a");
+        temp_path(p2, sizeof(p2), "n4b");
+        if (acpcm_encode4(p1, &in, 16, 1) == ERR_OK &&
+            acpcm_decode(p1, &fine) == ERR_OK && fine.count == in.count)
+            snr_fine = (double)nofft_decode_snr_db(in.samples, fine.samples,
+                                                   in.count);
+        if (acpcm_encode4(p2, &in, 16, 20) == ERR_OK &&
+            acpcm_decode(p2, &coarse) == ERR_OK && coarse.count == in.count)
+            snr_coarse = (double)nofft_decode_snr_db(in.samples, coarse.samples,
+                                                     in.count);
+        remove(p1);
+        remove(p2);
+        snprintf(det, sizeof(det), "step=1 %.2f dB vs step=20 %.2f dB",
+                 snr_fine, snr_coarse);
+        check(snr_fine > snr_coarse + 3.0, verbose,
+              "nfa4 finer step improves fidelity", det);
+        pcm_free(&fine);
+        pcm_free(&coarse);
+    }
+
+    /* flat signals stay exact */
+    {
+        static const float vals[] = { 0.0f, 0.75f };
+        for (size_t k = 0; k < sizeof(vals) / sizeof(vals[0]); k++) {
+            pcm_buf fi, fo;
+            Err fe;
+            memset(&fi, 0, sizeof(fi));
+            memset(&fo, 0, sizeof(fo));
+            fi.count = 4096;
+            fi.channels = 1;
+            fi.sample_rate = 44100;
+            fi.samples = (float*)malloc(fi.count * sizeof(float));
+            if (fi.samples == NULL)
+                break;
+            for (size_t i = 0; i < fi.count; i++)
+                fi.samples[i] = vals[k];
+            char fp[512];
+            temp_path(fp, sizeof(fp), "n4f");
+            fe = acpcm_encode4(fp, &fi, 16, 5);
+            if (fe == ERR_OK)
+                fe = acpcm_decode(fp, &fo);
+            remove(fp);
+            check(fe == ERR_OK && fo.count == fi.count && same(&fi, &fo),
+                  verbose, vals[k] == 0.0f ? "silence exact in nfa4"
+                                           : "dc exact in nfa4", NULL);
+            pcm_free(&fi);
+            pcm_free(&fo);
+        }
+    }
+
+    /* a signal far from the centre with sparse dips: the base shift keeps the
+       whole channel non-negative and the basket grid codes it in range */
+    {
+        pcm_buf si, so;
+        double ssnr;
+        Err fe;
+        memset(&si, 0, sizeof(si));
+        memset(&so, 0, sizeof(so));
+        si.count = frames;
+        si.channels = 1;
+        si.sample_rate = 44100;
+        si.samples = (float*)malloc(si.count * sizeof(float));
+        if (si.samples != NULL) {
+            for (size_t i = 0; i < si.count; i++)
+                si.samples[i] = 0.9f;
+            for (size_t k = 0; k < 24; k++)
+                si.samples[100 + k * 500] = -0.4f;
+            char sp[512];
+            temp_path(sp, sizeof(sp), "n4s");
+            fe = acpcm_encode4(sp, &si, 16, 8);
+            if (fe == ERR_OK)
+                fe = acpcm_decode(sp, &so);
+            remove(sp);
+            ssnr = (fe == ERR_OK && so.count == si.count)
+                       ? (double)nofft_decode_snr_db(si.samples, so.samples,
+                                                     si.count)
+                       : -99.0;
+            snprintf(det, sizeof(det), "snr=%.2f dB", ssnr);
+            check(fe == ERR_OK && so.count == si.count && ssnr >= 40.0,
+                  verbose, "nfa4 codes an off-centre range", det);
+            pcm_free(&si);
+            pcm_free(&so);
+        }
+    }
+
+    /* the flags are validated before any file is written */
+    expect_err(acpcm_encode4(path, &in, 16, 0), ERR_RANGE, verbose,
+               "nfa4 rejects step below the minimum");
+    expect_err(acpcm_encode4(path, &in, 16, 70000), ERR_RANGE, verbose,
+               "nfa4 rejects step above the maximum");
+    expect_err(acpcm_encode4(path, &in, 0, 5), ERR_RANGE, verbose,
+               "nfa4 rejects bits below the minimum");
+
+    pcm_free(&in);
+    pcm_free(&o4);
+}
+
 Err acpcm_selftest(int verbose)
 {
     failures = 0;
@@ -790,6 +948,7 @@ Err acpcm_selftest(int verbose)
     test_noise_bound(verbose);
     test_drift(verbose);
     test_baskets(verbose);
+    test_nfa4(verbose);
     test_rejects(verbose);
     printf("%s: %d failure(s)\n", failures ? "FAILED" : "passed", failures);
     return failures ? ERR_BAD_ARGS : ERR_OK;
