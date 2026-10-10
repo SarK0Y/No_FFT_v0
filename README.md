@@ -162,4 +162,4 @@ Donations: [https://boosty.to/alg0z/donate](https://boosty.to/alg0z/donate) [htt
 
 # Project has been assisted w/ awesome OpenCode 🙂
 
-# my the Best Wishes to You 🙃
+# my the Best Wishes to You, Dear User 🙃
