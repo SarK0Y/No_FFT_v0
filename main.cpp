@@ -8,6 +8,7 @@
 #include <unistd.h>
 #include <errno.h>
 #include <sys/wait.h>
+#include <sys/stat.h>
 #include <cmath>
 
 static double compute_snr(const float* a, const float* b, size_t n)
@@ -30,7 +31,12 @@ static void usage(const char* argv0)
         "  %s encode <in.wav> <out.no.fft> [frame_len] [degree] [f32|f16] [interp|least-sq]\n"
         "  %s decode <in.no.fft> <out.wav>\n"
         "  %s roundtrip <in.wav> [frame_len] [degree] [f32|f16] [interp|least-sq]\n"
-        "  %s convert <in.mp3> <out.no_fft> [frame_len] [degree] [f32|f16] [interp|least-sq]\n"
+        "  %s convert <in.mp3> <out> [-algo poly|nfa1|nfa2|nfa3|nfa4]\n"
+        "               [frame_len] [degree] [f32|f16] [interp|least-sq]   (poly)\n"
+        "               [-bits N] [-block N] [-policy ...] [-s N | -b N]   (nfa*)\n"
+        "  %s convert-all <in.mp3> <out-prefix>\n"
+        "               [frame_len] [degree] [f32|f16] [interp|least-sq]\n"
+        "               [-bits N] [-block N] [-policy ...] [-s N | -b N]\n"
         "  %s play <in.no_fft>                 (WAV to stdout, for piping)\n"
         "\n"
         "acpcm, sample-domain DPCM with a range coder (no polynomial):\n"
@@ -50,8 +56,10 @@ static void usage(const char* argv0)
         "    -s N           NFA4 basket grid: N percent of the channel range\n"
         "                   (default 5; caps at 101 baskets; NFA4 ignores `bits`)\n"
         "    -b N           NFA4 basket count instead of a step percent, 1..256\n"
-        "                   (needed above 101, e.g. -b 170; needs -v4)\n",
-        argv0, argv0, argv0, argv0, argv0,
+        "                   (needed above 101, e.g. -b 170; needs -v4)\n"
+        "    -algo name     convert codec: poly (default), nfa1, nfa2, nfa3, nfa4\n"
+        "    -bits N        acpcm quantiser width for convert/convert-all (default 6)\n",
+        argv0, argv0, argv0, argv0, argv0, argv0,
         argv0, argv0, argv0, argv0, argv0, argv0, argv0, argv0);
 }
 static uint32_t parse_u32(const char* s, uint32_t dflt)
@@ -181,10 +189,70 @@ static char* temp_wav_path(void)
     return p;
 }
 
+/* Encode one destination with the named algorithm and print the same one-line
+   summary that `convert` prints.  Returns ERR_OK, or the codec error to report.
+   Shared by `convert` (one algo) and `convert-all` (every algo). */
+static Err convert_emit(const char* algo, const char* in, const char* out,
+                        const pcm_buf* pcm, uint32_t cbits,
+                        uint32_t block_len, acpcm_p2_policy policy,
+                        uint32_t frame_len, uint32_t degree,
+                        nofft_coeff_format cf, nofft_fit fit,
+                        uint32_t step,
+                        bool have_baskets, uint32_t baskets)
+{
+    Err e;
+
+    if (strcmp(algo, "poly") == 0) {
+        e = nofft_encode(out, pcm, frame_len, (uint16_t)degree, cf, fit);
+    } else if (strcmp(algo, "nfa1") == 0) {
+        e = acpcm_encode(out, pcm, (uint16_t)cbits);
+    } else if (strcmp(algo, "nfa2") == 0) {
+        e = acpcm_encode2(out, pcm, (uint16_t)cbits, block_len, policy);
+    } else if (strcmp(algo, "nfa3") == 0) {
+        e = acpcm_encode3(out, pcm, (uint16_t)cbits);
+    } else {
+        e = have_baskets
+                ? acpcm_encode4_baskets(out, pcm, (uint16_t)cbits, baskets)
+                : acpcm_encode4(out, pcm, (uint16_t)cbits, step);
+    }
+    if (e != ERR_OK)
+        return e;
+
+    if (strcmp(algo, "poly") == 0) {
+        fprintf(stderr,
+                "%s -> %s  %u ch  %u Hz  frame_len=%u degree=%u coef=%s fit=%s  %zu samples\n",
+                in, out, pcm->channels, pcm->sample_rate,
+                frame_len, degree, nofft_coeff_format_str(cf),
+                nofft_fit_str(fit), pcm->count);
+    } else {
+        acpcm_info info;
+        double bps = 0.0;
+        char extra[64];
+
+        memset(&info, 0, sizeof(info));
+        if (acpcm_file_info(out, &info) == ERR_OK && info.frames != 0)
+            bps = 8.0 * (double)info.payload /
+                  ((double)info.frames * (double)info.channels);
+        extra[0] = '\0';
+        if (strcmp(algo, "nfa4") == 0)
+            snprintf(extra, sizeof(extra),
+                     have_baskets ? "  baskets=%u" : "  step=%u",
+                     have_baskets ? baskets : step);
+        else if (strcmp(algo, "nfa2") == 0)
+            snprintf(extra, sizeof(extra), "  block=%u policy=%s",
+                     block_len, policy_str(policy));
+        fprintf(stderr,
+                "%s -> %s  %u ch  %u Hz  algo=%s bits=%u%s  %.4f b/sample  %llu bytes\n",
+                in, out, pcm->channels, pcm->sample_rate, algo,
+                cbits, extra, bps, (unsigned long long)info.payload);
+    }
+    return ERR_OK;
+}
+
 int main(int argc, char** argv)
 {
-    uint32_t frame_len;
-    uint32_t degree;
+    uint32_t frame_len = 20;
+    uint32_t degree = 3;
     nofft_coeff_format cf = NOFFT_COEF_F32;
     nofft_fit fit = NOFFT_FIT_INTERP;
     pcm_buf pcm, dec;
@@ -361,17 +429,163 @@ int main(int argc, char** argv)
             return 2;
         }
 
-        frame_len = parse_u32(argc > 4 ? argv[4] : NULL, 20);
-        degree = parse_u32(argc > 5 ? argv[5] : NULL, 3);
+        /* -algo selects the codec.  The polynomial codec keeps the historical
+           positional [frame_len] [degree] [f32|f16] [interp|least-sq]; the
+           acpcm algorithms take flags instead. */
+        const char* algo = "poly";
+        uint32_t cbits = 6;
+        bool have_bits = false;
+        uint32_t block_len = 0;
+        acpcm_p2_policy policy = ACP2_DRIFT;
+        bool have_block = false;
+        bool have_policy = false;
+        bool have_step = false;
+        uint32_t step = 5;
+        bool have_baskets = false;
+        uint32_t baskets = 170;
+        const char* pos[4] = { NULL, NULL, NULL, NULL };
+        int npos = 0;
 
-        if (argc > 6 && argv[6][0] != '\0' &&
-            !nofft_coeff_format_parse(argv[6], &cf)) {
-            fprintf(stderr, "unknown coefficient format: %s (use f32 or f16)\n", argv[6]);
+        for (int i = 4; i < argc; i++) {
+            if (strcmp(argv[i], "-algo") == 0) {
+                if (i + 1 >= argc) {
+                    fprintf(stderr, "-algo needs poly, nfa1, nfa2, nfa3 or nfa4\n");
+                    return 2;
+                }
+                algo = argv[++i];
+                continue;
+            }
+            if (strcmp(argv[i], "-bits") == 0) {
+                if (i + 1 >= argc) {
+                    fprintf(stderr, "-bits needs a width\n");
+                    return 2;
+                }
+                cbits = parse_u32(argv[++i], 0);
+                have_bits = true;
+                continue;
+            }
+            if (strcmp(argv[i], "-block") == 0) {
+                if (i + 1 >= argc) {
+                    fprintf(stderr, "-block needs a frame count (>= 1)\n");
+                    return 2;
+                }
+                block_len = parse_u32(argv[++i], 0);
+                if (block_len == 0) {
+                    fprintf(stderr, "-block must be >= 1\n");
+                    return 2;
+                }
+                have_block = true;
+                continue;
+            }
+            if (strcmp(argv[i], "-policy") == 0) {
+                if (i + 1 >= argc || !parse_policy(argv[i + 1], &policy)) {
+                    fprintf(stderr, "policy must be never, always or drift\n");
+                    return 2;
+                }
+                have_policy = true;
+                i++;
+                continue;
+            }
+            if (strcmp(argv[i], "-s") == 0) {
+                if (i + 1 >= argc) {
+                    fprintf(stderr, "-s needs a basket width in percent (>= 1)\n");
+                    return 2;
+                }
+                step = parse_u32(argv[++i], 0);
+                if (step < ACPCM4_STEP_MIN || step > ACPCM4_STEP_MAX) {
+                    fprintf(stderr, "-s must be %u..%u\n",
+                            ACPCM4_STEP_MIN, ACPCM4_STEP_MAX);
+                    return 2;
+                }
+                have_step = true;
+                continue;
+            }
+            if (strcmp(argv[i], "-b") == 0) {
+                if (i + 1 >= argc) {
+                    fprintf(stderr, "-b needs a basket count (1..%u)\n",
+                            ACPCM4_MAX_BUCKETS);
+                    return 2;
+                }
+                baskets = parse_u32(argv[++i], 0);
+                if (baskets < ACPCM4_BASKETS_MIN ||
+                    baskets > ACPCM4_MAX_BUCKETS) {
+                    fprintf(stderr, "-b must be %u..%u\n",
+                            ACPCM4_BASKETS_MIN, ACPCM4_MAX_BUCKETS);
+                    return 2;
+                }
+                have_baskets = true;
+                continue;
+            }
+            if (argv[i][0] == '-') {
+                fprintf(stderr, "unknown flag: %s\n", argv[i]);
+                return 2;
+            }
+            if (npos >= 4) {
+                fprintf(stderr, "too many arguments\n");
+                return 2;
+            }
+            pos[npos++] = argv[i];
+        }
+
+        int is_poly = (strcmp(algo, "poly") == 0);
+        int is_nfa1 = (strcmp(algo, "nfa1") == 0);
+        int is_nfa2 = (strcmp(algo, "nfa2") == 0);
+        int is_nfa3 = (strcmp(algo, "nfa3") == 0);
+        int is_nfa4 = (strcmp(algo, "nfa4") == 0);
+        if (!is_poly && !is_nfa1 && !is_nfa2 && !is_nfa3 && !is_nfa4) {
+            fprintf(stderr,
+                    "unknown -algo: %s (use poly, nfa1, nfa2, nfa3 or nfa4)\n",
+                    algo);
             return 2;
         }
 
-        if (!parse_fit(argc > 7 ? argv[7] : NULL, &fit))
-            return 2;
+        if (is_poly) {
+            frame_len = parse_u32(pos[0], 20);
+            degree = parse_u32(pos[1], 3);
+            if (pos[2] != NULL && pos[2][0] != '\0' &&
+                !nofft_coeff_format_parse(pos[2], &cf)) {
+                fprintf(stderr,
+                        "unknown coefficient format: %s (use f32 or f16)\n",
+                        pos[2]);
+                return 2;
+            }
+            if (!parse_fit(pos[3], &fit))
+                return 2;
+            if (have_block || have_policy || have_step || have_baskets ||
+                have_bits) {
+                fprintf(stderr,
+                        "-bits/-block/-policy/-s/-b are only for the nfa* algos\n");
+                return 2;
+            }
+        } else {
+            if (npos != 0) {
+                fprintf(stderr, "the nfa* algos take flags, not positional args\n");
+                return 2;
+            }
+            if (cbits < ACPCM_BITS_MIN || cbits > ACPCM_BITS_MAX) {
+                fprintf(stderr, "-bits must be %d..%d\n",
+                        ACPCM_BITS_MIN, ACPCM_BITS_MAX);
+                return 2;
+            }
+            if ((have_block || have_policy) && !is_nfa2) {
+                fprintf(stderr, "-block/-policy are only for -algo nfa2\n");
+                return 2;
+            }
+            if ((have_step || have_baskets) && !is_nfa4) {
+                fprintf(stderr, "-s/-b are only for -algo nfa4\n");
+                return 2;
+            }
+            if (have_step && have_baskets) {
+                fprintf(stderr, "use either -s or -b, not both\n");
+                return 2;
+            }
+            if (have_policy && !have_block) {
+                fprintf(stderr, "-policy needs -block\n");
+                return 2;
+            }
+            if (is_nfa2 && !have_block)
+                block_len = 1024;   /* sensible refit window by default */
+        }
 
         tmp = temp_wav_path();
         if (tmp == NULL) {
@@ -394,7 +608,9 @@ int main(int argc, char** argv)
             return 1;
         }
 
-        e = nofft_encode(argv[3], &pcm, frame_len, (uint16_t)degree, cf, fit);
+        e = convert_emit(algo, argv[2], argv[3], &pcm, cbits, block_len,
+                         policy, frame_len, degree, cf, fit,
+                         step, have_baskets, baskets);
         if (e != ERR_OK) {
             fprintf(stderr, "%s: %s\n", argv[3], g_err_str(e));
             pcm_free(&pcm);
@@ -403,16 +619,183 @@ int main(int argc, char** argv)
             return 1;
         }
 
-        fprintf(stderr,
-                "%s -> %s  %u ch  %u Hz  frame_len=%u degree=%u coef=%s fit=%s  %zu samples\n",
-                argv[2], argv[3], pcm.channels, pcm.sample_rate,
-                frame_len, degree, nofft_coeff_format_str(cf),
-                nofft_fit_str(fit), pcm.count);
-
         pcm_free(&pcm);
         remove(tmp);
         free(tmp);
         return 0;
+    }
+
+    if (strcmp(argv[1], "convert-all") == 0) {
+        static const char* const algos[] = { "poly", "nfa1", "nfa2",
+                                             "nfa3", "nfa4" };
+        const size_t n_algos = sizeof(algos) / sizeof(algos[0]);
+        char* tmp;
+        uint32_t cbits = 6;
+        uint32_t block_len = 1024;
+        acpcm_p2_policy policy = ACP2_DRIFT;
+        bool have_step = false;
+        uint32_t step = 5;
+        bool have_baskets = false;
+        uint32_t baskets = 170;
+        const char* pos[4] = { NULL, NULL, NULL, NULL };
+        int npos = 0;
+        int failures = 0;
+        uint64_t total_bytes = 0;
+
+        if (argc < 4) {
+            usage(argv[0]);
+            return 2;
+        }
+
+        /* Same flags as `convert`, but every algorithm runs, so there is no
+           -algo.  The polynomial positional arguments still apply to `poly`. */
+        for (int i = 4; i < argc; i++) {
+            if (strcmp(argv[i], "-bits") == 0) {
+                if (i + 1 >= argc) {
+                    fprintf(stderr, "-bits needs a width\n");
+                    return 2;
+                }
+                cbits = parse_u32(argv[++i], 0);
+                continue;
+            }
+            if (strcmp(argv[i], "-block") == 0) {
+                if (i + 1 >= argc) {
+                    fprintf(stderr, "-block needs a frame count (>= 1)\n");
+                    return 2;
+                }
+                block_len = parse_u32(argv[++i], 0);
+                if (block_len == 0) {
+                    fprintf(stderr, "-block must be >= 1\n");
+                    return 2;
+                }
+                continue;
+            }
+            if (strcmp(argv[i], "-policy") == 0) {
+                if (i + 1 >= argc || !parse_policy(argv[i + 1], &policy)) {
+                    fprintf(stderr, "policy must be never, always or drift\n");
+                    return 2;
+                }
+                i++;
+                continue;
+            }
+            if (strcmp(argv[i], "-s") == 0) {
+                if (i + 1 >= argc) {
+                    fprintf(stderr, "-s needs a basket width in percent (>= 1)\n");
+                    return 2;
+                }
+                step = parse_u32(argv[++i], 0);
+                if (step < ACPCM4_STEP_MIN || step > ACPCM4_STEP_MAX) {
+                    fprintf(stderr, "-s must be %u..%u\n",
+                            ACPCM4_STEP_MIN, ACPCM4_STEP_MAX);
+                    return 2;
+                }
+                have_step = true;
+                continue;
+            }
+            if (strcmp(argv[i], "-b") == 0) {
+                if (i + 1 >= argc) {
+                    fprintf(stderr, "-b needs a basket count (1..%u)\n",
+                            ACPCM4_MAX_BUCKETS);
+                    return 2;
+                }
+                baskets = parse_u32(argv[++i], 0);
+                if (baskets < ACPCM4_BASKETS_MIN ||
+                    baskets > ACPCM4_MAX_BUCKETS) {
+                    fprintf(stderr, "-b must be %u..%u\n",
+                            ACPCM4_BASKETS_MIN, ACPCM4_MAX_BUCKETS);
+                    return 2;
+                }
+                have_baskets = true;
+                continue;
+            }
+            if (argv[i][0] == '-') {
+                fprintf(stderr, "unknown flag: %s\n", argv[i]);
+                return 2;
+            }
+            if (npos >= 4) {
+                fprintf(stderr, "too many arguments\n");
+                return 2;
+            }
+            pos[npos++] = argv[i];
+        }
+
+        frame_len = parse_u32(pos[0], 20);
+        degree = parse_u32(pos[1], 3);
+        if (pos[2] != NULL && pos[2][0] != '\0' &&
+            !nofft_coeff_format_parse(pos[2], &cf)) {
+            fprintf(stderr, "unknown coefficient format: %s (use f32 or f16)\n",
+                    pos[2]);
+            return 2;
+        }
+        if (!parse_fit(pos[3], &fit))
+            return 2;
+
+        if (cbits < ACPCM_BITS_MIN || cbits > ACPCM_BITS_MAX) {
+            fprintf(stderr, "-bits must be %d..%d\n",
+                    ACPCM_BITS_MIN, ACPCM_BITS_MAX);
+            return 2;
+        }
+        if (have_step && have_baskets) {
+            fprintf(stderr, "use either -s or -b, not both\n");
+            return 2;
+        }
+
+        tmp = temp_wav_path();
+        if (tmp == NULL) {
+            fprintf(stderr, "cannot create a temporary file\n");
+            return 1;
+        }
+
+        if (run_ffmpeg(argv[2], tmp) != 0) {
+            fprintf(stderr, "%s: cannot decode with ffmpeg\n", argv[2]);
+            remove(tmp);
+            free(tmp);
+            return 1;
+        }
+
+        e = wav_load(tmp, &pcm);
+        if (e != ERR_OK) {
+            fprintf(stderr, "%s: decoded audio: %s\n", argv[2], g_err_str(e));
+            remove(tmp);
+            free(tmp);
+            return 1;
+        }
+
+        for (size_t k = 0; k < n_algos; k++) {
+            char out[4096];
+            struct stat st;
+            const char* ext = strcmp(algos[k], "poly") == 0 ? "no_fft"
+                                                            : "nadc";
+            int n = snprintf(out, sizeof(out), "%s.%s.%s",
+                             argv[3], algos[k], ext);
+
+            if (n < 0 || (size_t)n >= sizeof(out)) {
+                fprintf(stderr, "%s.%s.%s: output path too long\n",
+                        argv[3], algos[k], ext);
+                failures++;
+                continue;
+            }
+
+            e = convert_emit(algos[k], argv[2], out, &pcm, cbits, block_len,
+                             policy, frame_len, degree, cf, fit,
+                             step, have_baskets, baskets);
+            if (e != ERR_OK) {
+                fprintf(stderr, "%s: %s\n", out, g_err_str(e));
+                failures++;
+                continue;
+            }
+            if (stat(out, &st) == 0)
+                total_bytes += (uint64_t)st.st_size;
+        }
+
+        fprintf(stderr,
+                "convert-all: %zu codecs, %d failed, %llu bytes total\n",
+                n_algos, failures, (unsigned long long)total_bytes);
+
+        pcm_free(&pcm);
+        remove(tmp);
+        free(tmp);
+        return failures == 0 ? 0 : 1;
     }
 
     if (strcmp(argv[1], "selftest") == 0)

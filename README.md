@@ -3,7 +3,7 @@
 A lossy audio codec family for `.no_fft` and `.nadc` files. No FFT is involved,
 at any stage.
 
-This README covers **NFA2** only. For the other algorithms, see:
+This README covers **NFA2** and the MP3 converter. For the other algorithms, see:
 
 - [NFA1: sample-domain DPCM with a range coder](./docs/nfa1.md)
 - [NFA3: residual baskets](./docs/nfa3.md)
@@ -21,6 +21,38 @@ make test       # both self tests, no input files needed
 make check-ac   # prove the C and C++ codecs agree byte for byte
 make clean
 ```
+
+## Convert from MP3 (all codecs)
+
+`convert-all` decodes an MP3 once (via `ffmpeg`) and writes every codec in one
+pass, named after the output prefix:
+
+```sh
+nofft convert-all song.mp3 out
+# out.poly.no_fft   polynomial fit
+# out.nfa1.nadc     sample-domain DPCM
+# out.nfa2.nadc     block-refit predictor
+# out.nfa3.nadc     residual baskets
+# out.nfa4.nadc     basket-only
+```
+
+`convert` writes a single codec selected with `-algo`. The two commands share
+their flags: `-bits N` sets the acpcm quantiser width (default 6); `-block N`
+and `-policy never|always|drift` shape NFA2; `-s N` or `-b N` shape NFA4 (a
+step percent or an exact basket count, e.g. 170). `-algo poly` keeps the
+historical polynomial positional arguments.
+
+```sh
+nofft convert song.mp3 song.no_fft -algo poly 20 4 f16
+nofft convert song.mp3 song.nfa3.nadc -algo nfa3 -bits 6
+nofft convert-all song.mp3 out -b 170          # NFA4 with 170 baskets
+```
+
+Both need `ffmpeg` on `PATH`; the decoded float32 WAV is temporary and removed
+on every path. `convert-all` reports one line per file plus a byte total, and
+keeps going if one algorithm fails. The
+[converter guide](./docs/converter.md) has the full flag reference; see the
+[No_FFT codec notes](./docs/nofft.md) for what `convert` does and does not suit.
 
 ## NFA2: forward adaptive predictor (experimental)
 

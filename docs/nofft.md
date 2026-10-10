@@ -18,7 +18,8 @@ lossless codecs. It is lossy by construction.
 nofft encode   <in.wav>    <out.no_fft> [frame_len] [degree] [f32|f16] [interp|least-sq]
 nofft decode   <in.no_fft> <out.wav>
 nofft roundtrip <in.wav>              [frame_len] [degree] [f32|f16] [interp|least-sq]
-nofft convert  <in.mp3> <out.no_fft>  [frame_len] [degree] [f32|f16] [interp|least-sq]
+nofft convert  <in.mp3> <out>         [-algo poly|nfa1|nfa2|nfa3|nfa4] [frame_len] [degree] [f32|f16] [interp|least-sq] [-bits N] [-block N] [-policy ...] [-s N | -b N]
+nofft convert-all <in.mp3> <out-prefix> [frame_len] [degree] [f32|f16] [interp|least-sq] [-bits N] [-block N] [-policy ...] [-s N | -b N]
 nofft play     <in.no_fft>
 ```
 
@@ -28,7 +29,7 @@ prints the resulting SNR without touching the disk.
 ```sh
 nofft roundtrip song.wav 20 4        # defaults: frame_len 20, degree 3, f32
 nofft encode song.wav song.no_fft 20 4 f16
-nfft convert song.mp3 song.no_fft 20 4 f16
+nofft convert song.mp3 song.no_fft 20 4 f16
 nofft play song.no_fft | mpv -
 ```
 
@@ -38,6 +39,58 @@ nofft play song.no_fft | mpv -
 WAV in a temporary file, and encodes that. The intermediate WAV is removed on
 every path, including failures. Filenames go straight to `ffmpeg` via `execvp`,
 never through a shell, so spaces and shell metacharacters in names are safe.
+
+`-algo` picks which codec the decoded audio is written with; the default `poly`
+is this polynomial codec. The acpcm algorithms take their own flags instead of
+the polynomial positional arguments:
+
+| `-algo` | Codec | Output | Extra flags |
+| --- | --- | --- | --- |
+| `poly` (default) | No_FFT polynomial | `.no_fft` | `[frame_len] [degree] [f32\|f16] [interp\|least-sq]` |
+| `nfa1` | NFA1 DPCM | `.nadc` | `-bits N` |
+| `nfa2` | NFA2 block-refit predictor | `.nadc` | `-bits N -block N -policy never\|always\|drift` |
+| `nfa3` | NFA3 residual baskets | `.nadc` | `-bits N` |
+| `nfa4` | NFA4 basket-only | `.nadc` | `-bits N` and `-s N` or `-b N` |
+
+```sh
+nofft convert song.mp3 song.no_fft -algo poly 20 4 f16
+nofft convert song.mp3 song.nfa1.nadc -algo nfa1 -bits 6
+nofft convert song.mp3 song.nfa2.nadc -algo nfa2 -block 1024 -policy drift
+nofft convert song.mp3 song.nfa3.nadc -algo nfa3
+nofft convert song.mp3 song.nfa4.nadc -algo nfa4 -b 170
+```
+
+`-algo poly` keeps the historical positional arguments, so an existing
+`convert song.mp3 song.no_fft 20 4 f16` still means exactly what it did. The
+MP3 is decoded afresh on each call, so convert a library to every codec with one
+`convert` call per algorithm.
+
+### Every codec at once
+
+`convert-all` decodes the input once and writes all five outputs, named after
+the prefix:
+
+| Output | Codec |
+| --- | --- |
+| `<prefix>.poly.no_fft` | No_FFT polynomial |
+| `<prefix>.nfa1.nadc` | NFA1 |
+| `<prefix>.nfa2.nadc` | NFA2 |
+| `<prefix>.nfa3.nadc` | NFA3 |
+| `<prefix>.nfa4.nadc` | NFA4 |
+
+It takes the same flags as `convert` — `-bits`, `-block`, `-policy`, `-s`/`-b`,
+and the polynomial positional arguments — without `-algo`, and prints one
+summary line per file followed by a total:
+
+```sh
+nofft convert-all song.mp3 out                 # out.poly.no_fft, out.nfa1.nadc, ...
+nofft convert-all song.mp3 out -b 170          # NFA4 with 170 baskets
+nofft convert-all song.mp3 out 32 5 f16 least-sq -block 512 -policy always
+```
+
+A failure on one algorithm is reported and the rest still run; the exit status
+is non-zero if any failed. The [converter guide](./converter.md) has the full
+flag reference shared by both commands.
 
 ### What MP3 cannot be represented by
 
