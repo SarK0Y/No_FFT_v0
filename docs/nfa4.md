@@ -83,8 +83,14 @@ baskets buys ~4.6 dB over 101 for ~0.75 b/s — which is why the count is stored
 directly instead of a step percent. This is a deliberately simple,
 predictor-free codec: one histogram, one symbol per sample.
 
-Speed pays for the basket symbol. Decoding drops to about 4.0 M frames/s on the
-crafted mono signal and 1.9 on the stereo track (NFA1: 18.0 and 10.8; NFA3: 7.3
-and 4.3): each sample is one symbol read against a multi-bin histogram. Encoding
-is *faster* than NFA3 (about 1.4x), because there is no predictor and no
-residual symbol, just the one basket index.
+Speed pays for the basket symbol. The adaptive histogram is indexed by a Fenwick
+(binary indexed) tree over the same frequencies `f[j] = cnt[j] + 1`, so both
+sides need only `O(log nb)` work per sample: the encoder asks it for the prefix
+sum up to the coded basket, the decoder for the basket that owns the current
+code. The integer products are the ones the linear model already used, so the
+bitstream is byte-for-byte unchanged; only the bookkeeping is faster. Because
+the linear version scanned up to `nb` entries per sample, the win grows with the
+basket count — decoding the `orig.wav` stereo track at 101 baskets goes from
+about 21.7 s to 3.6 s (~6x), and at 256 baskets from about 52 s to 4.0 s
+(~13x) on this machine. Encoding gains less (about 1.8x at 256 baskets) because
+the predictor-free channel planning and quantisation dominate its runtime.

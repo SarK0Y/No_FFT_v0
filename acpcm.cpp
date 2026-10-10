@@ -98,6 +98,80 @@ void rc_enc_multi(std::vector<uint8_t>& out, uint64_t& low, uint32_t& range,
         rc_shift_low(out, low, range, cache, cache_size);
 }
 
+/* Basket frequency index for NFA4: a Fenwick (binary indexed) tree over the
+   same frequencies rc_enc_multi and DecCtx::multi use, f[j] = cnt[j] + 1.  It
+   makes the encoder prefix sum and the decoder's search for the symbol that
+   holds `code` O(log M) instead of an O(M) scan, while computing the exact
+   same integer products, so the bitstream is unchanged.  `tot` is the codec's
+   sample counter (not the sum of f): the model uses tm = tot + M, matching the
+   linear version including its halving rule. */
+struct BasketTree {
+    int32_t cnt[ACPCM4_MAX_BUCKETS];
+    int64_t tree[ACPCM4_MAX_BUCKETS + 1];
+    int M;
+    int64_t tot;
+
+    void init(int m)
+    {
+        M = m;
+        for (int i = 0; i <= M; i++)
+            tree[i] = 0;
+        for (int i = 0; i < M; i++) {
+            cnt[i] = 0;
+            add(i, 1);
+        }
+        tot = 0;
+    }
+
+    void add(int i, int64_t v)
+    {
+        for (i++; i <= M; i += i & -i)
+            tree[i] += v;
+    }
+
+    int64_t pref(int j) const   /* sum_{k < j} f[k] */
+    {
+        int64_t s = 0;
+        for (; j > 0; j -= j & -j)
+            s += tree[j];
+        return s;
+    }
+
+    int find(int64_t x) const   /* largest j with pref(j) <= x */
+    {
+        int pos = 0;
+        int bit = 1;
+        while (bit <= M)
+            bit <<= 1;
+        for (bit >>= 1; bit; bit >>= 1) {
+            int nx = pos + bit;
+            if (nx <= M && tree[nx] <= x) {
+                pos = nx;
+                x -= tree[nx];
+            }
+        }
+        return pos < M ? pos : M - 1;
+    }
+
+    void bump(int sym)
+    {
+        cnt[sym]++;
+        tot++;
+        add(sym, 1);
+    }
+
+    void rescale()
+    {
+        for (int i = 0; i <= M; i++)
+            tree[i] = 0;
+        for (int i = 0; i < M; i++) {
+            cnt[i] >>= 1;
+            add(i, (int64_t)cnt[i] + 1);
+        }
+        tot >>= 1;
+    }
+};
+
 struct EncCtx {
     std::vector<uint8_t> out;
     uint64_t low;
@@ -118,6 +192,21 @@ struct EncCtx {
     void multi(const int32_t* cnt, int M, int64_t tot, int sym)
     {
         rc_enc_multi(out, low, range, cache, cache_size, cnt, M, tot, sym);
+    }
+    /* Same as multi(), with the cumulative frequency `cum` and the symbol
+       frequency `f` already known so a Fenwick tree can supply them in O(log M)
+       instead of the O(M) prefix scan. */
+    void multi_cum(int64_t cum, int64_t f, int64_t tm)
+    {
+        uint64_t l = ((uint64_t)range * (uint64_t)cum) / (uint64_t)tm;
+        uint32_t h = (uint32_t)(((uint64_t)range * (uint64_t)(cum + f)) /
+                                (uint64_t)tm);
+        low += l;
+        range = h - (uint32_t)l;
+        if (range == 0)
+            range = 1;
+        while (range < RC_TOP)
+            rc_shift_low(out, low, range, cache, cache_size);
     }
     void done() { rc_flush(out, low, range, cache, cache_size); }
 };
@@ -185,6 +274,30 @@ struct DecCtx {
         uint32_t lo = (uint32_t)(((uint64_t)range * (uint64_t)cum) /
                                  (uint64_t)tm);
         uint32_t hi = (uint32_t)(((uint64_t)range * (uint64_t)cum_hi) /
+                                 (uint64_t)tm);
+        code -= lo;
+        range = hi - lo;
+        if (range == 0)
+            range = 1;
+        norm();
+        return j;
+    }
+
+    /* Decode one symbol against a Fenwick basket model.  The symbol is the
+       largest index whose cumulative frequency pref(j) is <= x, where
+       x = (tm * (code + 1) - 1) / range is exactly the largest cumulative
+       boundary the linear scan in multi() would accept; the interval is then
+       advanced with the same floor products. */
+    int multi_tree(const BasketTree* t)
+    {
+        int64_t tm = t->tot + (int64_t)t->M;
+        int64_t x = ((int64_t)tm * ((int64_t)code + 1) - 1) / (int64_t)range;
+        int j = t->find(x);
+        int64_t cum = t->pref(j);
+        int64_t f = (int64_t)t->cnt[j] + 1;
+        uint32_t lo = (uint32_t)(((uint64_t)range * (uint64_t)cum) /
+                                 (uint64_t)tm);
+        uint32_t hi = (uint32_t)(((uint64_t)range * (uint64_t)(cum + f)) /
                                  (uint64_t)tm);
         code -= lo;
         range = hi - lo;
@@ -694,8 +807,8 @@ Err encode_chunk4(const float* s, size_t n, uint16_t bits, uint32_t nb,
     e.fixed(bits, 8);
     e.fixed(nb, 16);
 
-    std::vector<int32_t> cnt(ACPCM4_MAX_BUCKETS, 0);
-    int64_t tot = 0;
+    BasketTree bt;
+    bt.init((int)nb);
     for (size_t i = 0; i < n; i++) {
         int32_t xq = quant_clamp(s[i], 32768.0, -65536.0, 65535.0);
         int64_t u = (int64_t)xq - (int64_t)base_q;
@@ -706,14 +819,11 @@ Err encode_chunk4(const float* s, size_t n, uint16_t bits, uint32_t nb,
             b = (int)nb - 1;
         if (b < 0)
             b = 0;
-        e.multi(cnt.data(), (int)nb, tot, b);
-        cnt[b]++;
-        tot++;
-        if (tot > (int64_t)(1 << 20)) {
-            for (uint32_t k = 0; k < nb; k++)
-                cnt[k] >>= 1;
-            tot >>= 1;
-        }
+        e.multi_cum(bt.pref(b), (int64_t)bt.cnt[b] + 1,
+                    bt.tot + (int64_t)bt.M);
+        bt.bump(b);
+        if (bt.tot > (int64_t)(1 << 20))
+            bt.rescale();
     }
 
     e.done();
@@ -945,13 +1055,12 @@ struct DecChan {
     uint32_t block_len;  /* 0: NFA1/NFA3/NFA4, no flags */
     uint32_t in_block;   /* samples since the last boundary */
 
-    /* NFA4: adaptive basket histogram, updated after every sample. */
-    int32_t cnt4[ACPCM4_MAX_BUCKETS];
-    int nb4;            /* alphabet size: the transmitted basket count */
-    int64_t factor4;    /* nb4 - 1, baskets across the shifted range */
+    /* NFA4: adaptive basket histogram, updated after every sample, indexed by a
+       Fenwick tree so the symbol search is O(log M). */
+    BasketTree bt4;
+    int64_t factor4;    /* bt4.M - 1, baskets across the shifted range */
     int64_t peak4;      /* shifted channel range peak_q */
     int32_t base4;      /* signed grid offset on the 1/32768 scale */
-    int64_t tot4;       /* sum of cnt4, grows with each sample */
 
     Err init(const uint8_t* d, size_t n, uint16_t bits, uint32_t bl, int fmt)
     {
@@ -1012,11 +1121,8 @@ struct DecChan {
 
         base4 = bq;
         peak4 = (int64_t)pq;
-        nb4 = (int)nb;
-        factor4 = (int64_t)nb4 - 1;
-        for (int k = 0; k < nb4; k++)
-            cnt4[k] = 0;
-        tot4 = 0;
+        bt4.init((int)nb);
+        factor4 = (int64_t)bt4.M - 1;
         block_len = 0;
         in_block = 0;
         primed = true;   /* NFA4 has no seed sample; every sample is coded */
@@ -1031,7 +1137,7 @@ struct DecChan {
             return xh * peak + mean;
         }
         if (fmt == 3) {
-            int b = rc.multi(cnt4, nb4, tot4);
+            int b = rc.multi_tree(&bt4);
             int64_t out_q = (int64_t)base4;
             if (peak4 > 0 && factor4 > 0) {
                 int64_t lo = ceil_div((int64_t)b * peak4, factor4);
@@ -1042,13 +1148,9 @@ struct DecChan {
                 out_q = -65536;
             if (out_q > 65535)
                 out_q = 65535;
-            cnt4[b]++;
-            tot4++;
-            if (tot4 > (int64_t)(1 << 20)) {
-                for (int k = 0; k < nb4; k++)
-                    cnt4[k] >>= 1;
-                tot4 >>= 1;
-            }
+            bt4.bump(b);
+            if (bt4.tot > (int64_t)(1 << 20))
+                bt4.rescale();
             in_block++;
             return (double)out_q / 32768.0;
         }
