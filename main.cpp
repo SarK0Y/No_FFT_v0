@@ -34,11 +34,11 @@ static void usage(const char* argv0)
         "  %s play <in.no_fft>                 (WAV to stdout, for piping)\n"
         "\n"
         "acpcm, sample-domain DPCM with a range coder (no polynomial):\n"
-        "  %s ac-encode <in.wav> <out.nadc> [bits] [-snr] [-block N] [-policy never|always|drift] [-v3] [-v4 -s N]\n"
+        "  %s ac-encode <in.wav> <out.nadc> [bits] [-snr] [-block N] [-policy never|always|drift] [-v3] [-v4 -s N | -b N]\n"
         "  %s ac-decode <in.nadc> <out.wav>\n"
         "  %s ac-play <in.nadc>               (WAV to stdout, for piping)\n"
         "  %s ac-info <in.nadc>\n"
-        "  %s ac-roundtrip <in.wav> [bits] [-block N] [-policy never|always|drift] [-v3] [-v4 -s N]\n"
+        "  %s ac-roundtrip <in.wav> [bits] [-block N] [-policy never|always|drift] [-v3] [-v4 -s N | -b N]\n"
         "  %s ac-gen <out.wav> [seconds] [ch] [rate]\n"
         "  %s ac-play-alsa <in.nadc> [-d device]\n"
         "  %s selftest\n"
@@ -48,7 +48,9 @@ static void usage(const char* argv0)
         "    -v3            write NFA3 (adaptive basket table; no -block)\n"
         "    -v4            write NFA4 (basket-only; no -block, no -v3)\n"
         "    -s N           NFA4 basket grid: N percent of the channel range\n"
-        "                   (default 5; NFA4 ignores `bits`)\n",
+        "                   (default 5; caps at 101 baskets; NFA4 ignores `bits`)\n"
+        "    -b N           NFA4 basket count instead of a step percent, 1..256\n"
+        "                   (needed above 101, e.g. -b 170; needs -v4)\n",
         argv0, argv0, argv0, argv0, argv0,
         argv0, argv0, argv0, argv0, argv0, argv0, argv0, argv0);
 }
@@ -428,6 +430,8 @@ int main(int argc, char** argv)
         bool v4 = false;
         bool have_step = false;
         uint32_t step = 5;
+        bool have_baskets = false;
+        uint32_t baskets = 170;
         bool show_snr = false;
         const char* in = NULL;
         const char* out = NULL;
@@ -457,6 +461,22 @@ int main(int argc, char** argv)
                     return 2;
                 }
                 have_step = true;
+                continue;
+            }
+            if (strcmp(argv[i], "-b") == 0) {
+                if (i + 1 >= argc) {
+                    fprintf(stderr, "-b needs a basket count (1..%u)\n",
+                            ACPCM4_MAX_BUCKETS);
+                    return 2;
+                }
+                baskets = parse_u32(argv[++i], 0);
+                if (baskets < ACPCM4_BASKETS_MIN ||
+                    baskets > ACPCM4_MAX_BUCKETS) {
+                    fprintf(stderr, "-b must be %u..%u\n",
+                            ACPCM4_BASKETS_MIN, ACPCM4_MAX_BUCKETS);
+                    return 2;
+                }
+                have_baskets = true;
                 continue;
             }
             if (strcmp(argv[i], "-block") == 0) {
@@ -508,6 +528,14 @@ int main(int argc, char** argv)
             fprintf(stderr, "-s needs -v4\n");
             return 2;
         }
+        if (have_baskets && !v4) {
+            fprintf(stderr, "-b needs -v4\n");
+            return 2;
+        }
+        if (have_step && have_baskets) {
+            fprintf(stderr, "use either -s or -b, not both\n");
+            return 2;
+        }
         if (bits < ACPCM_BITS_MIN || bits > ACPCM_BITS_MAX) {
             fprintf(stderr, "bits must be %d..%d\n", ACPCM_BITS_MIN, ACPCM_BITS_MAX);
             return 2;
@@ -520,7 +548,9 @@ int main(int argc, char** argv)
         }
 
         if (v4)
-            e = acpcm_encode4(out, &pcm, (uint16_t)bits, step);
+            e = have_baskets
+                    ? acpcm_encode4_baskets(out, &pcm, (uint16_t)bits, baskets)
+                    : acpcm_encode4(out, &pcm, (uint16_t)bits, step);
         else if (v3)
             e = acpcm_encode3(out, &pcm, (uint16_t)bits);
         else if (block_len != 0)
@@ -539,7 +569,9 @@ int main(int argc, char** argv)
             char extra[64];
             extra[0] = '\0';
             if (v4)
-                snprintf(extra, sizeof(extra), "  step=%u", step);
+                snprintf(extra, sizeof(extra),
+                         have_baskets ? "  baskets=%u" : "  step=%u",
+                         have_baskets ? baskets : step);
             else if (v3)
                 snprintf(extra, sizeof(extra), "  baskets");
             else if (info.block_len != 0)
@@ -697,6 +729,8 @@ int main(int argc, char** argv)
         bool v4 = false;
         bool have_step = false;
         uint32_t step = 5;
+        bool have_baskets = false;
+        uint32_t baskets = 170;
         double peak = 0.0;
         const char* in = NULL;
 
@@ -721,6 +755,22 @@ int main(int argc, char** argv)
                     return 2;
                 }
                 have_step = true;
+                continue;
+            }
+            if (strcmp(argv[i], "-b") == 0) {
+                if (i + 1 >= argc) {
+                    fprintf(stderr, "-b needs a basket count (1..%u)\n",
+                            ACPCM4_MAX_BUCKETS);
+                    return 2;
+                }
+                baskets = parse_u32(argv[++i], 0);
+                if (baskets < ACPCM4_BASKETS_MIN ||
+                    baskets > ACPCM4_MAX_BUCKETS) {
+                    fprintf(stderr, "-b must be %u..%u\n",
+                            ACPCM4_BASKETS_MIN, ACPCM4_MAX_BUCKETS);
+                    return 2;
+                }
+                have_baskets = true;
                 continue;
             }
             if (strcmp(argv[i], "-block") == 0) {
@@ -771,6 +821,14 @@ int main(int argc, char** argv)
             fprintf(stderr, "-s needs -v4\n");
             return 2;
         }
+        if (have_baskets && !v4) {
+            fprintf(stderr, "-b needs -v4\n");
+            return 2;
+        }
+        if (have_step && have_baskets) {
+            fprintf(stderr, "use either -s or -b, not both\n");
+            return 2;
+        }
         if (bits < ACPCM_BITS_MIN || bits > ACPCM_BITS_MAX) {
             fprintf(stderr, "bits must be %d..%d\n", ACPCM_BITS_MIN, ACPCM_BITS_MAX);
             return 2;
@@ -790,7 +848,9 @@ int main(int argc, char** argv)
         }
 
         if (v4)
-            e = acpcm_encode4(tmp, &pcm, (uint16_t)bits, step);
+            e = have_baskets
+                    ? acpcm_encode4_baskets(tmp, &pcm, (uint16_t)bits, baskets)
+                    : acpcm_encode4(tmp, &pcm, (uint16_t)bits, step);
         else if (v3)
             e = acpcm_encode3(tmp, &pcm, (uint16_t)bits);
         else if (block_len != 0)
@@ -838,7 +898,9 @@ int main(int argc, char** argv)
                 char extra[64];
                 extra[0] = '\0';
                 if (v4)
-                    snprintf(extra, sizeof(extra), "  step=%u", step);
+                    snprintf(extra, sizeof(extra),
+                             have_baskets ? "  baskets=%u" : "  step=%u",
+                             have_baskets ? baskets : step);
                 else if (v3)
                     snprintf(extra, sizeof(extra), "  baskets");
                 else if (block_len != 0)

@@ -781,9 +781,11 @@ static void test_baskets(int verbose)
 }
 
 /* NFA4: the basket-only codec.  Everything must round trip: the shifted grid
-   and the transmitted basket table are the whole stream.  A finer step must
-   beat a coarser one on the same signal, and a flat channel (peak_q == 0) has
-   every sample in bucket 0 whose midpoint is 0, so silence and DC stay exact. */
+   and the per-sample adaptive basket histogram are the whole stream.  A finer
+   basket count must beat a coarser one on the same signal, a 170-basket grid
+   must work even though the integer-percent step caps at 101 rows, and a flat
+   channel (peak_q == 0) has every sample in bucket 0 whose midpoint is 0, so
+   silence and DC stay exact. */
 static void test_nfa4(int verbose)
 {
     const size_t frames = 12000;
@@ -861,6 +863,35 @@ static void test_nfa4(int verbose)
         pcm_free(&coarse);
     }
 
+    /* The integer-percent grid caps at 101 rows, so a 170-basket grid needs the
+       count-based entry point.  It must round trip and beat 101 baskets on the
+       same signal. */
+    {
+        pcm_buf fine, mid;
+        double snr170 = -99.0, snr101 = -99.0;
+        char p1[512], p2[512];
+        memset(&fine, 0, sizeof(fine));
+        memset(&mid, 0, sizeof(mid));
+        temp_path(p1, sizeof(p1), "n4c");
+        temp_path(p2, sizeof(p2), "n4d");
+        if (acpcm_encode4_baskets(p1, &in, 16, 170) == ERR_OK &&
+            acpcm_decode(p1, &fine) == ERR_OK && fine.count == in.count)
+            snr170 = (double)nofft_decode_snr_db(in.samples, fine.samples,
+                                                 in.count);
+        if (acpcm_encode4_baskets(p2, &in, 16, 101) == ERR_OK &&
+            acpcm_decode(p2, &mid) == ERR_OK && mid.count == in.count)
+            snr101 = (double)nofft_decode_snr_db(in.samples, mid.samples,
+                                                 in.count);
+        remove(p1);
+        remove(p2);
+        snprintf(det, sizeof(det), "170 baskets %.2f dB vs 101 baskets %.2f dB",
+                 snr170, snr101);
+        check(snr170 > snr101 + 1.0, verbose,
+              "nfa4 170-basket grid beats 101", det);
+        pcm_free(&fine);
+        pcm_free(&mid);
+    }
+
     /* flat signals stay exact */
     {
         static const float vals[] = { 0.0f, 0.75f };
@@ -910,7 +941,7 @@ static void test_nfa4(int verbose)
                 si.samples[100 + k * 500] = -0.4f;
             char sp[512];
             temp_path(sp, sizeof(sp), "n4s");
-            fe = acpcm_encode4(sp, &si, 16, 8);
+            fe = acpcm_encode4(sp, &si, 16, 1);
             if (fe == ERR_OK)
                 fe = acpcm_decode(sp, &so);
             remove(sp);
@@ -933,6 +964,12 @@ static void test_nfa4(int verbose)
                "nfa4 rejects step above the maximum");
     expect_err(acpcm_encode4(path, &in, 0, 5), ERR_RANGE, verbose,
                "nfa4 rejects bits below the minimum");
+    expect_err(acpcm_encode4_baskets(path, &in, 16, 0), ERR_RANGE, verbose,
+               "nfa4 rejects a zero basket count");
+    expect_err(acpcm_encode4_baskets(path, &in, 16, ACPCM4_MAX_BUCKETS + 1),
+               ERR_RANGE, verbose, "nfa4 rejects a basket count over the max");
+    expect_err(acpcm_encode4_baskets(path, &in, 0, 170), ERR_RANGE, verbose,
+               "nfa4 baskets rejects bits below the minimum");
 
     pcm_free(&in);
     pcm_free(&o4);

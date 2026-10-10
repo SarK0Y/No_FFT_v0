@@ -167,11 +167,13 @@ static Res run3(const pcm_buf* in, uint16_t bits, int reps)
 }
 
 /* NFA4 path: the basket-only codec.  The channel is shifted so its minimum
-   sits at zero, then every sample is coded as one basket index on a `step`
-   percent grid of the shifted range; there is no predictor and no residual.
-   The bits argument is kept for the file header but does not affect the grid;
-   step sets the bucket width. */
-static Res run4(const pcm_buf* in, uint16_t bits, uint32_t step, int reps)
+   sits at zero, then every sample is coded as one basket index on a grid of
+   the shifted range; there is no predictor and no residual.  The bits argument
+   is kept for the file header but does not affect the grid.  `grid` is either
+   a step percent (run4) or a basket count (run4_baskets); the count path is the
+   only way past the 101 rows an integer-percent step allows. */
+static Res run4_grid(const pcm_buf* in, uint16_t bits, uint32_t grid,
+                     int by_baskets, int reps)
 {
     char path[128];
     snprintf(path, sizeof(path), "acp2m4_%d.acp", (int)getpid());
@@ -182,7 +184,8 @@ static Res run4(const pcm_buf* in, uint16_t bits, uint32_t step, int reps)
 
     for (int rep = 0; rep < reps; rep++) {
         double t0 = now_ms();
-        Err e = acpcm_encode4(path, in, bits, step);
+        Err e = by_baskets ? acpcm_encode4_baskets(path, in, bits, grid)
+                           : acpcm_encode4(path, in, bits, grid);
         double t1 = now_ms();
         if (e != ERR_OK) {
             remove(path);
@@ -222,6 +225,19 @@ static Res run4(const pcm_buf* in, uint16_t bits, uint32_t step, int reps)
     r.dec_ms = best_d;
     r.ok = 1;
     return r;
+}
+
+/* step percent path (nb = 100/step + 1, at most 101 rows) */
+static Res run4(const pcm_buf* in, uint16_t bits, uint32_t step, int reps)
+{
+    return run4_grid(in, bits, step, 0, reps);
+}
+
+/* direct basket count path, 1..ACPCM4_MAX_BUCKETS */
+static Res run4_baskets(const pcm_buf* in, uint16_t bits, uint32_t baskets,
+                        int reps)
+{
+    return run4_grid(in, bits, baskets, 1, reps);
 }
 
 static pcm_buf alloc_pcm(size_t frames, uint16_t ch, uint32_t rate)
@@ -497,26 +513,24 @@ static void table_nfa4(const pcm_buf* sigs[], const char* names[], size_t n)
 static void table_nfa4_baskets(const pcm_buf* sigs[], const char* names[],
                                size_t n)
 {
-    /* Target basket counts; the grid step is derived from the count:
-       step = floor(100/baskets)+1 gives exactly `baskets` rows for any
-       non-flat channel, since the range maps to floor(100/step) buckets. */
+    /* Exact basket counts, including the 170 and 256 grids the integer-percent
+       step cannot express. */
     static const uint32_t want[] = { 2, 3, 4, 5, 6, 8, 11, 16, 21, 26, 34,
-                                     51, 101 };
+                                     51, 101, 170, 256 };
     printf("T10 NFA4 rate and fidelity by basket count, bits=8\n"
-           "  baskets is the number of transmitted table rows (nb), so the\n"
-           "  per-sample basket symbol costs about log2(baskets) bits; step is\n"
-           "  the grid percent derived from the count.  A flat channel reports\n"
-           "  baskets=1 regardless (its range is zero).\n");
+           "  baskets is the grid alphabet size nb, stored in the header, so the\n"
+           "  per-sample basket symbol costs about log2(baskets) bits and the\n"
+           "  grid is exact (no integer-percent cap at 101 rows).  Every channel,\n"
+           "  flat or not, uses the full alphabet (the count is not data\n"
+           "  dependent).\n");
     for (size_t k = 0; k < n; k++) {
         printf("  %s (%zux%u)\n", names[k],
                sigs[k]->count / sigs[k]->channels, sigs[k]->channels);
-        printf("| baskets | step | NFA4 b/s | NFA4 SNR dB |\n"
-               "|---:|---:|---:|---:|\n");
+        printf("| baskets | NFA4 b/s | NFA4 SNR dB |\n"
+               "|---:|---:|---:|\n");
         for (size_t j = 0; j < sizeof(want) / sizeof(want[0]); j++) {
-            uint32_t step = (uint32_t)(100u / want[j]) + 1u;
-            Res v4 = run4(sigs[k], 8, step, 1);
-            printf("| %ld | %u | %.4f | %.2f |\n",
-                   g_acp4_baskets, step, v4.bps, v4.snr);
+            Res v4 = run4_baskets(sigs[k], 8, want[j], 1);
+            printf("| %u | %.4f | %.2f |\n", want[j], v4.bps, v4.snr);
         }
     }
     printf("\n");

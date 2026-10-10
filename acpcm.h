@@ -55,11 +55,12 @@
  * no block_len, no refit flag and no length-table offset change.
  *
  * NFA4 (magic "NFA4") is basket-only: no predictor and no residual, one symbol
- * per sample.  The header carries the shifted-grid range peak_q and the channel
- * minimum base_q; every sample maps to u = xq - base_q and is floored onto a
- * `step` percent grid of peak_q: i_b = floor(u * 100 / (peak_q * step)).  The
- * basket table is transmitted once per chunk as [count: int32 | edge: float16]
- * rows.  The decoder rebuilds the bucket midpoint and returns
+ * per sample.  The header carries the shifted-grid range peak_q, the channel
+ * minimum base_q, and the basket count nb; every sample maps to u = xq - base_q
+ * and is floored onto nb equal baskets of peak_q, with factor = nb - 1:
+ * i_b = floor(u * factor / peak_q).  The basket histogram is adaptive: it starts
+ * at zero on both sides and is updated after every sample, so no table is
+ * transmitted.  The decoder rebuilds the basket midpoint and returns
  * (base_q + mid) / 32768.  A flat channel has peak_q == 0 and decodes exactly.
  * The fixed header is the NFA1 20 byte layout (format 3, block_len 0).
  */
@@ -78,9 +79,12 @@
 #define ACPCM_BITS_MIN      2
 #define ACPCM_BITS_MAX      24
 #define ACPCM_MAX_BASKETS   25   /* classes 0..bits-1 plus the escape class */
-/* NFA4: basket grid of `step` percent of the channel range; the shifted index
-   stays under 100/step.  256 is a safety bound. */
+/* NFA4: basket grid of `baskets` equal buckets over the shifted channel range.
+   The count, not a step percent, is stored in the header, so the grid is not
+   capped at the 101 rows an integer-percent step allows.  256 is a safety
+   bound (the alphabet is scanned once per sample, so this bounds decode cost). */
 #define ACPCM4_MAX_BUCKETS  256
+#define ACPCM4_BASKETS_MIN  1
 #define ACPCM4_STEP_MIN     1
 #define ACPCM4_STEP_MAX     65535
 
@@ -119,14 +123,24 @@ Err acpcm_encode3(const char* path, const pcm_buf* p, uint16_t bits);
 
 /* NFA4, the basket-only codec: the channel is shifted so its minimum is at
    zero (base_q), and every sample carries one basket index
-   i_b = floor((xq - base_q) * 100 / (peak_q * step)) on a `step` percent grid
-   of the shifted range.  The decoder rebuilds the bucket midpoint and adds
-   base_q back; there is no predictor and no residual.  The transmitted table is
-   [count, edge_k*step] (percent of range).  `bits` is stored for the header but
-   does not affect the grid.  `step` outside ACPCM4_STEP_MIN..ACPCM4_STEP_MAX is
-   rejected with ERR_RANGE. */
+   i_b = floor((xq - base_q) * (nb - 1) / peak_q) into `nb` equal buckets of
+   the shifted range.  The decoder rebuilds the bucket midpoint and adds base_q
+   back; there is no predictor and no residual.  The basket histogram is
+   adaptive: starts at zero on both sides, updates after every sample, and is
+   not transmitted.  `bits` is stored for the header but does not affect the
+   grid.  This entry point takes a bucket width in percent and maps it to
+   nb = 100/step + 1 (so step 1 gives 101 baskets); it is a convenience wrapper
+   over acpcm_encode4_baskets.  `step` outside ACPCM4_STEP_MIN..ACPCM4_STEP_MAX
+   is rejected with ERR_RANGE. */
 Err acpcm_encode4(const char* path, const pcm_buf* p, uint16_t bits,
                   uint32_t step);
+
+/* NFA4 with the basket count given directly, 1..ACPCM4_MAX_BUCKETS.  This is
+   the only way to ask for more than the 101 buckets the integer-percent step
+   grid can express (e.g. 170).  A count outside the range is rejected with
+   ERR_RANGE. */
+Err acpcm_encode4_baskets(const char* path, const pcm_buf* p, uint16_t bits,
+                          uint32_t baskets);
 
 Err acpcm_decode(const char* path, pcm_buf* out);
 

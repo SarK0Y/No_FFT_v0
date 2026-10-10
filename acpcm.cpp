@@ -633,67 +633,36 @@ Err encode_chunk3(const float* s, size_t n, const ChanPlan& pl,
     return ERR_OK;
 }
 
-/* ---- NFA4: float16 deviation field ----
- *
- * The transmitted table carries one float16 percentage per basket.  The
- * decoded table is kept for inspection; it is a real IEEE 754 binary16, so an
- * external tool can print the percentage each row was meant to carry.  The
- * window arithmetic never reads it back -- both sides derive [lo, hi) from
- * the identical integers, so f16 rounding can never move a boundary.
- */
-uint16_t f16_from_f32(float v)
+/* ceil(v / d) for v >= 0 and d >= 1, the basket window boundary in sample
+   units.  Callers guard d > 0 (a single-basket grid never reconstructs). */
+int64_t ceil_div(int64_t v, int64_t d)
 {
-    uint32_t u;
-    memcpy(&u, &v, 4);
-    uint32_t s = (u >> 16) & 0x8000u;
-    uint32_t e = (u >> 23) & 0xFFu;
-    uint32_t m = u & 0x7FFFFFu;
-
-    if (e == 0xFFu)
-        return (uint16_t)(s | 0x7C00u | (m ? 0x200u : 0u));
-    int32_t ne = (int32_t)e - 127 + 15;
-    if (ne >= 31)
-        return (uint16_t)(s | 0x7C00u);
-    if (ne <= 0) {
-        if (ne < -10)
-            return (uint16_t)s;
-        m |= 0x800000u;                    /* implicit bit of the subnormal */
-        uint32_t sh = (uint32_t)(14 - ne);
-        uint32_t half = 1u << (sh - 1);
-        return (uint16_t)(s + ((m + half) >> sh));
-    }
-    uint32_t r = ((uint32_t)ne << 10) | (m >> 13);
-    if ((m & 0x1000u) && ((m & 0x0FFFu) != 0u || (r & 1u) != 0u))
-        r++;
-    return (uint16_t)(s + r);
-}
-
-/* ceil(v / 100) for v >= 0, the bucket window boundary in sample units. */
-int64_t ceil_div100(int64_t v)
-{
-    return (v + 99) / 100;
+    return (v + d - 1) / d;
 }
 /*
  * NFA4, the basket codec: no predictor and no residual, just one basket symbol
- * per sample coded from a transmitted histogram.  So that a basket can be a
- * plain magnitude class with no sign symbol, the channel grid is shifted first:
- * the header carries the channel minimum base_q, every sample is mapped to
- * u = xq - base_q >= 0, and the decoder adds base_q back.  On the shifted grid
- * u is split into step-percent buckets of the channel range peak_q:
- *   - b = floor(u * 100 / (peak_q * step))
- *   - the decoder reconstructs the bucket midpoint
- *       mid_b = (ceil(b*peak_q*step/100) + ceil((b+1)*peak_q*step/100)) / 2
+ * per sample coded from an adaptive histogram that updates after every sample.
+ * So that a basket can be a plain magnitude class with no sign symbol, the
+ * channel grid is shifted first: the header carries the channel minimum base_q,
+ * every sample is mapped to u = xq - base_q >= 0, and the decoder adds base_q
+ * back.  On the shifted grid u is split into `nb` equal baskets of the channel
+ * range peak_q, with factor = nb - 1:
+ *   - b = floor(u * factor / peak_q)
+ *   - the decoder reconstructs the basket midpoint
+ *       mid_b = (ceil(b*peak_q/factor) + ceil((b+1)*peak_q/factor)) / 2
  *     and returns (base_q + mid_b) / 32768
- * The histogram is transmitted (first pass) and also used as the model for the
- * basket index (second pass).  A flat channel has peak_q == 0 and decodes
+ * The header stores nb itself, so the grid is any requested basket count up to
+ * ACPCM4_MAX_BUCKETS rather than the 101 rows an integer-percent step caps at.
+ * The histogram starts at zero on both sides and is updated after every sample,
+ * so no table is transmitted.  A flat channel has peak_q == 0 and decodes
  * exactly: every sample lands in bucket 0, whose midpoint is 0.
  */
 
-Err encode_chunk4(const float* s, size_t n, uint16_t bits, uint32_t step,
+Err encode_chunk4(const float* s, size_t n, uint16_t bits, uint32_t nb,
                    std::vector<uint8_t>* out)
 {
-    (void)bits;   /* basket grid is set by `step`; bits is kept for the header */
-    if (step < ACPCM4_STEP_MIN || step > ACPCM4_STEP_MAX)
+    (void)bits;   /* the basket grid is set by nb; bits is kept for the header */
+    if (nb < ACPCM4_BASKETS_MIN || nb > ACPCM4_MAX_BUCKETS)
         return ERR_RANGE;
 
     /* Reject NaN and out-of-range first; the header fields are 1/32768 over
@@ -717,43 +686,34 @@ Err encode_chunk4(const float* s, size_t n, uint16_t bits, uint32_t step,
     }
     int32_t base_q = lo_q;
     int64_t peak_q = (int64_t)hi_q - (int64_t)lo_q;
-    int64_t unit = peak_q * (int64_t)step;
-    if (unit <= 0)
-        unit = 1;
-
-    std::vector<int32_t> cnt(ACPCM4_MAX_BUCKETS, 0);
-    int nb = 1;
-    for (size_t i = 0; i < n; i++) {
-        int32_t xq = quant_clamp(s[i], 32768.0, -65536.0, 65535.0);
-        int64_t b = ((int64_t)xq - (int64_t)base_q) * 100 / unit;
-        if (b < 0 || b >= ACPCM4_MAX_BUCKETS)
-            return ERR_RANGE;
-        cnt[(int)b]++;
-        if ((int)b + 1 > nb)
-            nb = (int)b + 1;
-    }
+    int64_t factor = (int64_t)nb - 1;
 
     EncCtx e;
     e.fixed((uint32_t)peak_q, 32);
     e.fixed((uint32_t)base_q, 32);
     e.fixed(bits, 8);
-    e.fixed(step, 16);
-    e.fixed((uint32_t)nb, 16);
-    for (int k = 0; k < nb; k++) {
-        e.fixed((uint32_t)cnt[k], 32);
-        e.fixed(f16_from_f32((float)((double)k * (double)step)), 16);
-    }
+    e.fixed(nb, 16);
 
-    int64_t tot = (int64_t)n;
+    std::vector<int32_t> cnt(ACPCM4_MAX_BUCKETS, 0);
+    int64_t tot = 0;
     for (size_t i = 0; i < n; i++) {
         int32_t xq = quant_clamp(s[i], 32768.0, -65536.0, 65535.0);
         int64_t u = (int64_t)xq - (int64_t)base_q;
-        int b = (int)((u * 100) / unit);
-        if (b >= nb)
-            b = nb - 1;
+        int b = 0;
+        if (peak_q > 0 && factor > 0)
+            b = (int)((u * factor) / peak_q);
+        if (b >= (int)nb)
+            b = (int)nb - 1;
         if (b < 0)
             b = 0;
-        e.multi(cnt.data(), nb, tot, b);
+        e.multi(cnt.data(), (int)nb, tot, b);
+        cnt[b]++;
+        tot++;
+        if (tot > (int64_t)(1 << 20)) {
+            for (uint32_t k = 0; k < nb; k++)
+                cnt[k] >>= 1;
+            tot >>= 1;
+        }
     }
 
     e.done();
@@ -766,7 +726,7 @@ Err encode_chunk4(const float* s, size_t n, uint16_t bits, uint32_t step,
 
 static Err acpcm_encode_impl(const char* path, const pcm_buf* p, uint16_t bits,
                              uint32_t block_len, acpcm_p2_policy policy,
-                             bool v3, uint32_t step)
+                             bool v3, uint32_t step, uint32_t baskets)
 {
     if (p == NULL || p->samples == NULL || p->channels == 0)
         return ERR_BAD_ARGS;
@@ -784,14 +744,28 @@ static Err acpcm_encode_impl(const char* path, const pcm_buf* p, uint16_t bits,
        samples are visited in; a stride parameter here is an easy way to get
        a subtly different plan from the one that was measured. */
     std::vector<std::vector<uint8_t> > chunks(ch);
+    bool nfa4 = (step != 0 || baskets != 0);
+    uint32_t nb4 = 0;
+    if (nfa4) {
+        /* A direct basket count wins; otherwise map the step percent, which
+           the integer-percent grid caps at 101 rows for step = 1. */
+        uint32_t n = baskets;
+        if (n == 0)
+            n = (step > 100u) ? 1u : (100u / step) + 1u;
+        if (n < ACPCM4_BASKETS_MIN)
+            n = ACPCM4_BASKETS_MIN;
+        if (n > ACPCM4_MAX_BUCKETS)
+            n = ACPCM4_MAX_BUCKETS;
+        nb4 = n;
+    }
     for (size_t c = 0; c < ch; c++) {
         std::vector<float> gath(frames);
         for (size_t i = 0; i < frames; i++)
             gath[i] = p->samples[i * ch + c];
         Err e;
-        if (step != 0) {
+        if (nfa4) {
             /* NFA4 plans its own shifted grid, so skip the predictor plan */
-            e = encode_chunk4(gath.data(), frames, bits, step, &chunks[c]);
+            e = encode_chunk4(gath.data(), frames, bits, nb4, &chunks[c]);
         } else {
             ChanPlan pl;
             e = plan_channel(gath.data(), frames, bits, &pl);
@@ -812,7 +786,7 @@ static Err acpcm_encode_impl(const char* path, const pcm_buf* p, uint16_t bits,
         payload += chunks[c].size();
 
     int v2 = (block_len != 0);
-    const char* magic = step ? ACPCM_MAGIC4
+    const char* magic = nfa4 ? ACPCM_MAGIC4
                      : (v3 ? ACPCM_MAGIC3 : (v2 ? ACPCM_MAGIC2 : ACPCM_MAGIC));
     size_t base = v2 ? (size_t)ACPCM_FIXED_HEADER2 : (size_t)ACPCM_FIXED_HEADER;
     size_t hsz = base + 4 * ch;
@@ -843,7 +817,7 @@ static Err acpcm_encode_impl(const char* path, const pcm_buf* p, uint16_t bits,
 
 Err acpcm_encode(const char* path, const pcm_buf* p, uint16_t bits)
 {
-    return acpcm_encode_impl(path, p, bits, 0, ACP2_NEVER, false, 0);
+    return acpcm_encode_impl(path, p, bits, 0, ACP2_NEVER, false, 0, 0);
 }
 
 Err acpcm_encode2(const char* path, const pcm_buf* p, uint16_t bits,
@@ -853,12 +827,12 @@ Err acpcm_encode2(const char* path, const pcm_buf* p, uint16_t bits,
         return ERR_RANGE;
     if ((int)policy < (int)ACP2_NEVER || (int)policy > (int)ACP2_DRIFT)
         return ERR_RANGE;
-    return acpcm_encode_impl(path, p, bits, block_len, policy, false, 0);
+    return acpcm_encode_impl(path, p, bits, block_len, policy, false, 0, 0);
 }
 
 Err acpcm_encode3(const char* path, const pcm_buf* p, uint16_t bits)
 {
-    return acpcm_encode_impl(path, p, bits, 0, ACP2_NEVER, true, 0);
+    return acpcm_encode_impl(path, p, bits, 0, ACP2_NEVER, true, 0, 0);
 }
 
 Err acpcm_encode4(const char* path, const pcm_buf* p, uint16_t bits,
@@ -866,7 +840,15 @@ Err acpcm_encode4(const char* path, const pcm_buf* p, uint16_t bits,
 {
     if (step < ACPCM4_STEP_MIN || step > ACPCM4_STEP_MAX)
         return ERR_RANGE;
-    return acpcm_encode_impl(path, p, bits, 0, ACP2_NEVER, false, step);
+    return acpcm_encode_impl(path, p, bits, 0, ACP2_NEVER, false, step, 0);
+}
+
+Err acpcm_encode4_baskets(const char* path, const pcm_buf* p, uint16_t bits,
+                          uint32_t baskets)
+{
+    if (baskets < ACPCM4_BASKETS_MIN || baskets > ACPCM4_MAX_BUCKETS)
+        return ERR_RANGE;
+    return acpcm_encode_impl(path, p, bits, 0, ACP2_NEVER, false, 0, baskets);
 }
 
 Err acpcm_file_info(const char* path, acpcm_info* out)
@@ -963,13 +945,13 @@ struct DecChan {
     uint32_t block_len;  /* 0: NFA1/NFA3/NFA4, no flags */
     uint32_t in_block;   /* samples since the last boundary */
 
-    /* NFA4: the transmitted table and the arithmetic it is indexed by. */
+    /* NFA4: adaptive basket histogram, updated after every sample. */
     int32_t cnt4[ACPCM4_MAX_BUCKETS];
-    int nb4;            /* rows actually transmitted */
-    int step4;          /* grid step in percent */
+    int nb4;            /* alphabet size: the transmitted basket count */
+    int64_t factor4;    /* nb4 - 1, baskets across the shifted range */
+    int64_t peak4;      /* shifted channel range peak_q */
     int32_t base4;      /* signed grid offset on the 1/32768 scale */
-    int64_t unit4;      /* peak_q * step4, the basket denominator */
-    int64_t tot4;       /* sum of cnt4, must equal the frame count */
+    int64_t tot4;       /* sum of cnt4, grows with each sample */
 
     Err init(const uint8_t* d, size_t n, uint16_t bits, uint32_t bl, int fmt)
     {
@@ -1013,40 +995,28 @@ struct DecChan {
         return ERR_OK;
     }
 
-    /* NFA4 chunk: the shifted-grid peak and base, the grid step, the row count
-       and the whole transmitted table.  Every sample is coded, so tot4 is the
-       frame count (there is no seed sample). */
+    /* NFA4 chunk: the shifted-grid peak and base, and the basket count.  The
+       basket histogram is adaptive (starts at zero, updates after every
+       sample), so no table is transmitted.  Every sample is coded, so the
+       frame count is not stored either. */
     Err init4(uint16_t bits)
     {
         uint32_t pq = rc.fixed(32);
         int32_t bq = (int32_t)rc.fixed(32);
         uint32_t hb = rc.fixed(8);
-        uint32_t sp = rc.fixed(16);
-        uint32_t nn = rc.fixed(16);
+        uint32_t nb = rc.fixed(16);
 
         if (hb != (uint32_t)bits ||
-            sp < ACPCM4_STEP_MIN || sp > ACPCM4_STEP_MAX ||
-            nn == 0 || nn > ACPCM4_MAX_BUCKETS)
+            nb < ACPCM4_BASKETS_MIN || nb > ACPCM4_MAX_BUCKETS)
             return ERR_BAD_NOFFT;
 
         base4 = bq;
-        step4 = (int)sp;
-        unit4 = (int64_t)pq * (int64_t)sp;
-        if (unit4 <= 0)
-            unit4 = 1;
-
+        peak4 = (int64_t)pq;
+        nb4 = (int)nb;
+        factor4 = (int64_t)nb4 - 1;
+        for (int k = 0; k < nb4; k++)
+            cnt4[k] = 0;
         tot4 = 0;
-        for (uint32_t k = 0; k < nn; k++) {
-            uint32_t c = rc.fixed(32);
-            uint16_t dv = (uint16_t)rc.fixed(16);
-            if (dv != f16_from_f32((float)((double)k * (double)step4)))
-                return ERR_BAD_NOFFT;    /* table row is not k * step */
-            cnt4[(int)k] = (int32_t)c;
-            tot4 += (int64_t)c;
-        }
-        if (tot4 < 0)
-            return ERR_BAD_NOFFT;
-        nb4 = (int)nn;
         block_len = 0;
         in_block = 0;
         primed = true;   /* NFA4 has no seed sample; every sample is coded */
@@ -1062,13 +1032,23 @@ struct DecChan {
         }
         if (fmt == 3) {
             int b = rc.multi(cnt4, nb4, tot4);
-            int64_t lo = ceil_div100((int64_t)b * unit4);
-            int64_t hi = ceil_div100((int64_t)(b + 1) * unit4);
-            int64_t out_q = (int64_t)base4 + (lo + hi) / 2;
+            int64_t out_q = (int64_t)base4;
+            if (peak4 > 0 && factor4 > 0) {
+                int64_t lo = ceil_div((int64_t)b * peak4, factor4);
+                int64_t hi = ceil_div((int64_t)(b + 1) * peak4, factor4);
+                out_q += (lo + hi) / 2;
+            }
             if (out_q < -65536)
                 out_q = -65536;
             if (out_q > 65535)
                 out_q = 65535;
+            cnt4[b]++;
+            tot4++;
+            if (tot4 > (int64_t)(1 << 20)) {
+                for (int k = 0; k < nb4; k++)
+                    cnt4[k] >>= 1;
+                tot4 >>= 1;
+            }
             in_block++;
             return (double)out_q / 32768.0;
         }
@@ -1180,14 +1160,6 @@ Err acpcm_dec_open(const char* path, AcpcmDecoder** out)
     for (size_t c = 0; c < ch && e == ERR_OK; c++)
         e = d->ch[c].init(d->raw[c].data(), d->raw[c].size(), d->info.bits,
                           d->info.block_len, d->info.format);
-
-    if (e == ERR_OK && d->info.format == 3) {
-        for (size_t c = 0; c < ch; c++)
-            if (d->ch[c].tot4 != (int64_t)frames) {
-                e = ERR_BAD_NOFFT;
-                break;
-            }
-    }
 
     if (e != ERR_OK) {
         delete d;
