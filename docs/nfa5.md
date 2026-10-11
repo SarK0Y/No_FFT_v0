@@ -118,6 +118,27 @@ The measured curve on a 440 Hz tone (mono, `e = 2`) sits next to NFA1:
     0.01     45.5 dB   6.84 b/sample
     0.001    65.5 dB  10.20 b/sample
 
+### The low-rate dial
+
+`err` is the rate control. On the codebase's standard test signal (the
+chirp/tone mix from `ac-gen`, mono) the 2.3..3.0 bits/sample window sits at
+`-set-err 0.18..0.25`:
+
+    err       SNR       rate
+    0.18     20.4 dB   2.78 b/sample
+    0.22     18.8 dB   2.53 b/sample
+    0.25     17.4 dB   2.37 b/sample
+
+At these settings NFA5 tracks the loudness (and never overshoots full scale,
+thanks to the grid-top clamp) but the waveform is a coarse step track: the
+absolute quantum near silence is `u * (e^err - 1) / 32768`, about 0.2..0.28
+sample units across the window, because the +32769 offset that keeps `u > 0`
+also inflates the absolute step at low level. A low-amplitude tone therefore
+collapses to a few tenths of a bit per sample with poor waveform fidelity; feed
+it signals that swing a reasonable fraction of full scale. This is inherent to
+the strictly positive offset and is the main thing to fix if low-rate NFA5 ever
+needs to carry quiet material.
+
 ## Format
 
 Container magic `NFA5`; the fixed header is the NFA1 20-byte layout (magic,
