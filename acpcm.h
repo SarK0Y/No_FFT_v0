@@ -75,6 +75,21 @@
  * lossy by construction: the geometric grid cannot hit every integer, so a
  * round trip is one quantiser step away, not bit exact.  The fixed header is
  * the NFA1 20 byte layout (format 4, block_len 0).
+ *
+ * NFA6 (magic "NFA6") is NFA5 with NFA2's blocked container.  The fixed header
+ * again gains uint32 block_len at offset 20 (24 bytes total).  Inside every
+ * chunk the encoder re-fits the log-domain quantum err at each block boundary
+ * as a per-block rate control: it bisects err until the block's estimated K
+ * cost fits a per-block slice of the target bits/sample, then range-codes one
+ * 8 bit log-spaced code before the first K of the block.  The decoder reads
+ * the code and rebuilds the same step table; the only transmitted state is one
+ * byte per block and the encoder's policy is never seen or trusted.  Quiet
+ * blocks keep a fine step almost free (their K are mostly 0), loud or fast
+ * blocks coarsen to stay in budget, so the target rate is met block by block
+ * instead of only on average - which is exactly what a fixed err cannot do
+ * (a coarse err that is right for the loudest passage is many sample units
+ * wide near silence, and a fine one is extortionate on a fast sweep).  e stays
+ * per chunk; err is per block and is never an argument.  Lossy like NFA5.
  */
 
 #include <stdint.h>
@@ -87,6 +102,7 @@
 #define ACPCM_MAGIC3        "NFA3"
 #define ACPCM_MAGIC4        "NFA4"
 #define ACPCM_MAGIC5        "NFA5"
+#define ACPCM_MAGIC6        "NFA6"
 #define ACPCM_FIXED_HEADER  20
 #define ACPCM_FIXED_HEADER2 24
 #define ACPCM_BITS_MIN      2
@@ -114,6 +130,10 @@
 #define ACPCM5_ERR_MIN     5e-4
 #define ACPCM5_ERR_MAX     1.0
 
+/* NFA6: err is auto-selected per block (never an argument); the only dial is
+   the target bits/sample, which each block's encoder-side fit tries to meet. */
+#define ACPCM6_RATE_DEFAULT 2.6
+
 /* NFA2: when does the encoder refit a1 at a block boundary?  NEVER keeps the
    stream bit identical to NFA1 (flags all zero); the refit itself is decided
    encoder side, the decoder only reads what was sent. */
@@ -127,8 +147,8 @@ typedef struct {
     uint16_t bits;       /* quantiser width actually used */
     uint32_t channels;
     uint32_t sample_rate;
-    uint32_t block_len;  /* NFA2 block length in frames, 0 for NFA1/NFA3/NFA4/NFA5 */
-    uint8_t  format;     /* 0: NFA1, 1: NFA2, 2: NFA3, 3: NFA4, 4: NFA5 */
+    uint32_t block_len;  /* NFA2/NFA6 block length in frames, 0 for NFA1/NFA3/NFA4/NFA5 */
+    uint8_t  format;     /* 0: NFA1, 1: NFA2, 2: NFA3, 3: NFA4, 4: NFA5, 5: NFA6 */
     uint64_t frames;     /* frames per channel */
     uint64_t payload;    /* bytes of range coded payload */
     uint64_t total;      /* whole file size */
@@ -191,6 +211,28 @@ Err acpcm_encode4_baskets(const char* path, const pcm_buf* p, uint16_t bits,
 Err acpcm_encode5(const char* path, const pcm_buf* p, uint16_t bits,
                   double e, double err);
 
+/* NFA6, NFA5 with a per-block re-fit of the log-domain quantum (see the
+   container note above): the header carries block_len, and every block's err is
+   chosen by an encoder-side rate control - bisected so the block's estimated K
+   cost fits a per-block slice of `rate` bits/sample - then range-coded as one
+   8 bit log-spaced code.  Quiet blocks stay fine almost free, loud or fast
+   blocks coarsen to stay in budget, and the target rate is met block by block.
+   `rate` must be finite and > 0; `e` must be > 1 and finite; `block_len` must
+   be >= 1.  Lossy like NFA5. */
+Err acpcm_encode6(const char* path, const pcm_buf* p, uint16_t bits,
+                  uint32_t block_len, double e, double rate);
+
+/* NFA5 with an auto-dialed global err: one err per chunk, bisected so the
+   chunk's estimated K cost fits `rate` bits/sample.  This is the mis-dial
+   cure - a quiet file dials itself fine (and stays cheap because its K are
+   mostly 0), a loud or fast one coarsens to hold the rate, and budget
+   migrates from easy to hard material the way hand tuning would - without
+   NFA6's per-block equal budgets, which overpay quiet blocks and starve hard
+   ones on mixed material.  The file format is plain NFA5; only the choice of
+   err is automatic.  `rate` must be finite and > 0. */
+Err acpcm_encode5_auto(const char* path, const pcm_buf* p, uint16_t bits,
+                       double e, double rate);
+
 Err acpcm_decode(const char* path, pcm_buf* out);
 
 /* Header only, no decoding. */
@@ -198,8 +240,8 @@ Err acpcm_file_info(const char* path, acpcm_info* out);
 
 /* Decodes the residual symbols of an NFA1 (or NFA2) stream into `out` without
    rebuilding the samples; the refit flags NFA2 codes are consumed so the two
-   sides stay in step.  NFA3/NFA4/NFA5 carry no single residual symbol and are
-   rejected with ERR_UNSUPPORTED_FMT.  Release the result with
+   sides stay in step.  NFA3/NFA4/NFA5/NFA6 carry no single residual symbol and
+   are rejected with ERR_UNSUPPORTED_FMT.  Release the result with
    acpcm_codes_free. */
 Err acpcm_extract_codes(const char* path, acpcm_codes* out);
 void acpcm_codes_free(acpcm_codes* c);

@@ -136,8 +136,51 @@ sample units across the window, because the +32769 offset that keeps `u > 0`
 also inflates the absolute step at low level. A low-amplitude tone therefore
 collapses to a few tenths of a bit per sample with poor waveform fidelity; feed
 it signals that swing a reasonable fraction of full scale. This is inherent to
-the strictly positive offset and is the main thing to fix if low-rate NFA5 ever
-needs to carry quiet material.
+the strictly positive offset, and a fixed global `err` cannot avoid it: one
+number cannot be right for both a quiet and a loud passage.
+
+### Auto-dial: `-set-rate`
+
+The fix is to let the encoder choose `err` instead of the user. `-set-rate X`
+(encoder side only, `acpcm_encode5_auto`) bisects one global `err` per chunk so
+that the estimated cost of the channel's `K` stream fits `X` bits/sample. The
+file is plain NFA5; only the choice of `err` is automatic, so the decoder and
+the format are unchanged.
+
+The estimator is the Shannon entropy of the `K` histogram at the candidate `err`
+(`k_entropy_bits`, the same cost model NFA6 uses). The chosen `err` is then
+written into the chunk exactly as a hand-dialled one.
+
+This is the cure for the collapse above: a quiet chunk dials itself *fine* and
+stays cheap (its `K` are mostly 0, so a fine step costs almost nothing), while a
+loud or fast chunk coarsens to hold the rate. On the same signals, against a
+fixed `err` chosen for loud material:
+
+    signal                     fixed err 0.18       -set-rate 2.6
+    quiet tone (0.125)          8.8 dB @ 0.33      39.8 dB @ 2.78
+    loud tone (0.9)            24.6 dB @ 1.47      32.2 dB @ 2.60
+    mixed quiet+loud tone      22.3 dB @ 0.90      37.2 dB @ 2.43
+    mixed quiet+loud sweep     22.1 dB @ 1.90      21.7 dB @ 1.89
+
+(The fixed column often spends *more* than 2.6 b/s - that is the point: one
+`err` cannot hold the rate, so it either overshoots or collapses.)
+
+The delivered rate lands within a few tenths of the target on tonal material. On
+chirp-heavy material it lands **below** target (e.g. 1.9 against 2.6): the
+zero-order entropy of the `K` histogram over-estimates what the adaptive range
+coder actually spends on a smooth, slowly-varying `K` stream, so the encoder
+picks a coarser step than the budget would allow. That only leaves quality on
+the table; it never overshoots the rate badly. A single `AUTO_ERR_FUDGE`
+constant calibrates the systematic gap and is kept at `1.0`.
+
+`-set-rate` and `-set-err` are mutually exclusive with `-v5`/`-algo nfa5`: dial
+by hand, or dial by rate. See [nfa6.md](./nfa6.md) for the blocked variant that
+re-fits `err` per block instead of once per chunk.
+
+The bisection runs the estimator at ~24 candidate `err` values per chunk, so an
+auto-dialled encode costs a few times a plain NFA5 encode (about 3.7 s against
+1.0 s for a 60 s stereo file here). Decoding is unchanged: it just reads the
+`err` the encoder wrote.
 
 ## Format
 
@@ -161,15 +204,18 @@ one adaptive symbol model.
 
 ```sh
 nofft ac-encode    song.wav song.nadc 8 -v5 -set-e 2 -set-err 0.01 -snr
+nofft ac-encode    song.wav song.nadc 8 -v5 -set-rate 2.6 -snr   # auto-dial
 nofft ac-roundtrip song.wav 8 -v5 -set-e 2 -set-err 0.01
 nofft ac-info      song.nadc                 # ... format=nfa5 log-grid
 nofft convert      song.mp3 song.nadc -algo nfa5 -set-e 2 -set-err 0.01
+nofft convert      song.mp3 song.nadc -algo nfa5 -set-rate 2.6
 nofft convert-all  song.mp3 out/             # includes nfa5
 ```
 
 `-set-e` and `-set-err` are encode-time and require `-v5` (or `-algo nfa5`); the
-decoder reads both from the file. They cannot be combined with `-block`,
-`-policy`, `-v3`, `-v4`, `-s` or `-b`.
+decoder reads both from the file. `-set-rate` is the auto-dial (`-v5` or
+`-algo nfa5`) and is mutually exclusive with `-set-err`. None of them can be
+combined with `-block`, `-policy`, `-v3`, `-v4`, `-s` or `-b`.
 
 ## Notes
 
