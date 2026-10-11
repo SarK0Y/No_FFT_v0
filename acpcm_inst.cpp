@@ -839,12 +839,118 @@ Err encode_chunk4(const float* s, size_t n, uint16_t bits, uint32_t nb,
     return ERR_OK;
 }
 
+/* NFA5, the multiplicative (log-domain) predictor: one symbol per sample, the
+ * integer exponent K of the per-step ratio e^(K*err).  The grid is shifted onto
+ * u = xq + ACPCM5_OFFSET so it is strictly positive, the first sample is a raw
+ * 16 bit seed like NFA1, and every later sample is coded as
+ *   K = round( log(u[n] / u[n-1]) / (err * log e) )
+ * with the decoder rebuilding u[n] = clamp(round(u[n-1] * e^(K*err))).  The
+ * encoder must advance on the reconstructed u[n-1], not the source, or the two
+ * sides desync on the first rounding.  e^(K*err) is precomputed into a 16.16
+ * fixed-point table so the sample loop is integer only.  The geometric grid
+ * cannot hit every integer, so the codec is lossy by construction.
+ */
+
+/* Build the shared step table F[K] = round(e^(K*err) * 2^16) for
+   K in [-kmax, kmax].  Both sides call this with the *decoded* doubles, so the
+   table is bit-identical and no libm runs in the sample loop.  kmax spans the
+   whole positive grid (a ratio of ACPCM5_OFFSET .. 65536 on u), clamped to
+   ACPCM5_MAX_STEPS; factors are clipped at 2^34, well inside the 64 bit
+   product, because any factor that large clamps the update to the grid top. */
+void build_grid5(double e, double err, int* kmax_out,
+                 std::vector<uint64_t>* f)
+{
+    double need = std::log(65536.0) / err;
+    int kmax = (int)std::ceil(need) + 1;
+    if (kmax > ACPCM5_MAX_STEPS)
+        kmax = ACPCM5_MAX_STEPS;
+    if (kmax < 1)
+        kmax = 1;
+    f->assign((size_t)(2 * kmax + 1), 1);
+    for (int k = -kmax; k <= kmax; k++) {
+        double v = std::pow(e, (double)k * err) * 65536.0;
+        uint64_t fx;
+        if (!(v > 1.0))
+            fx = 1;
+        else if (v >= 17179869184.0)   /* 2^34 */
+            fx = (uint64_t)1 << 34;
+        else
+            fx = (uint64_t)std::floor(v + 0.5);
+        (*f)[(size_t)(k + kmax)] = fx;
+    }
+    *kmax_out = kmax;
+}
+
+/* Integer half-up multiply by the table factor: pred = round(u * F/2^16). */
+int32_t grid5_step(int32_t u, uint64_t factor)
+{
+    uint64_t p = ((uint64_t)u * factor + (1u << 15)) >> 16;
+    if (p < 1)
+        p = 1;
+    if (p > 65536)
+        p = 65536;
+    return (int32_t)p;
+}
+
+Err encode_chunk5(const float* s, size_t n, double ebase, double err,
+                  std::vector<uint8_t>* out)
+{
+    for (size_t i = 0; i < n; i++) {
+        double a = s[i] < 0.0 ? -s[i] : s[i];
+        if (!(a == a) || a > PEAK_LIMIT)
+            return ERR_BAD_INPUT;
+    }
+
+    int kmax = 0;
+    std::vector<uint64_t> F;
+    build_grid5(ebase, err, &kmax, &F);
+
+    EncCtx e;
+    uint64_t ebits, rbits;
+    memcpy(&ebits, &ebase, sizeof(ebits));
+    memcpy(&rbits, &err, sizeof(rbits));
+    e.fixed((uint32_t)(ebits >> 32), 32);
+    e.fixed((uint32_t)ebits, 32);
+    e.fixed((uint32_t)(rbits >> 32), 32);
+    e.fixed((uint32_t)rbits, 32);
+
+    int32_t xq0 = quant_clamp(s[0], 32768.0, -32768.0, 32767.0);
+    e.fixed((uint32_t)(uint16_t)(int16_t)xq0, 16);
+    int32_t prev = xq0 + ACPCM5_OFFSET;
+
+    SymModel m;
+    sym_init(&m);
+    double inv = 1.0 / (err * std::log(ebase));
+
+    for (size_t i = 1; i < n; i++) {
+        int32_t xq = quant_clamp(s[i], 32768.0, -32768.0, 32767.0);
+        int32_t ut = xq + ACPCM5_OFFSET;
+        double kk = (std::log((double)ut) - std::log((double)prev)) * inv;
+        if (!(kk == kk))
+            kk = 0.0;
+        /* clamp before rounding: a very flat base e makes inv huge, and an
+           int32 cast of an out-of-range double is undefined behaviour */
+        if (kk > (double)kmax)
+            kk = (double)kmax;
+        if (kk < -(double)kmax)
+            kk = -(double)kmax;
+        int32_t K = (int32_t)quant_fixed(kk, 1.0);
+        prev = grid5_step(prev, F[(size_t)(K + kmax)]);
+        enc_sym(&e, &m, K);
+    }
+
+    e.done();
+    out->swap(e.out);
+    return ERR_OK;
+}
+
 
 } /* namespace */
 
 static Err acpcm_encode_impl(const char* path, const pcm_buf* p, uint16_t bits,
                              uint32_t block_len, acpcm_p2_policy policy,
-                             bool v3, uint32_t step, uint32_t baskets)
+                             bool v3, uint32_t step, uint32_t baskets,
+                             bool v5, double e5, double err5)
 {
     if (p == NULL || p->samples == NULL || p->channels == 0)
         return ERR_BAD_ARGS;
@@ -884,6 +990,9 @@ static Err acpcm_encode_impl(const char* path, const pcm_buf* p, uint16_t bits,
         if (nfa4) {
             /* NFA4 plans its own shifted grid, so skip the predictor plan */
             e = encode_chunk4(gath.data(), frames, bits, nb4, &chunks[c]);
+        } else if (v5) {
+            /* NFA5 is multiplicative: no predictor plan, just the log grid */
+            e = encode_chunk5(gath.data(), frames, e5, err5, &chunks[c]);
         } else {
             ChanPlan pl;
             e = plan_channel(gath.data(), frames, bits, &pl);
@@ -905,6 +1014,7 @@ static Err acpcm_encode_impl(const char* path, const pcm_buf* p, uint16_t bits,
 
     int v2 = (block_len != 0);
     const char* magic = nfa4 ? ACPCM_MAGIC4
+                     : v5 ? ACPCM_MAGIC5
                      : (v3 ? ACPCM_MAGIC3 : (v2 ? ACPCM_MAGIC2 : ACPCM_MAGIC));
     size_t base = v2 ? (size_t)ACPCM_FIXED_HEADER2 : (size_t)ACPCM_FIXED_HEADER;
     size_t hsz = base + 4 * ch;
@@ -935,7 +1045,8 @@ static Err acpcm_encode_impl(const char* path, const pcm_buf* p, uint16_t bits,
 
 Err acpcm_encode(const char* path, const pcm_buf* p, uint16_t bits)
 {
-    return acpcm_encode_impl(path, p, bits, 0, ACP2_NEVER, false, 0, 0);
+    return acpcm_encode_impl(path, p, bits, 0, ACP2_NEVER, false, 0, 0,
+                             false, 0.0, 0.0);
 }
 
 Err acpcm_encode2(const char* path, const pcm_buf* p, uint16_t bits,
@@ -945,12 +1056,14 @@ Err acpcm_encode2(const char* path, const pcm_buf* p, uint16_t bits,
         return ERR_RANGE;
     if ((int)policy < (int)ACP2_NEVER || (int)policy > (int)ACP2_DRIFT)
         return ERR_RANGE;
-    return acpcm_encode_impl(path, p, bits, block_len, policy, false, 0, 0);
+    return acpcm_encode_impl(path, p, bits, block_len, policy, false, 0, 0,
+                             false, 0.0, 0.0);
 }
 
 Err acpcm_encode3(const char* path, const pcm_buf* p, uint16_t bits)
 {
-    return acpcm_encode_impl(path, p, bits, 0, ACP2_NEVER, true, 0, 0);
+    return acpcm_encode_impl(path, p, bits, 0, ACP2_NEVER, true, 0, 0,
+                             false, 0.0, 0.0);
 }
 
 Err acpcm_encode4(const char* path, const pcm_buf* p, uint16_t bits,
@@ -958,7 +1071,8 @@ Err acpcm_encode4(const char* path, const pcm_buf* p, uint16_t bits,
 {
     if (step < ACPCM4_STEP_MIN || step > ACPCM4_STEP_MAX)
         return ERR_RANGE;
-    return acpcm_encode_impl(path, p, bits, 0, ACP2_NEVER, false, step, 0);
+    return acpcm_encode_impl(path, p, bits, 0, ACP2_NEVER, false, step, 0,
+                             false, 0.0, 0.0);
 }
 
 Err acpcm_encode4_baskets(const char* path, const pcm_buf* p, uint16_t bits,
@@ -966,7 +1080,19 @@ Err acpcm_encode4_baskets(const char* path, const pcm_buf* p, uint16_t bits,
 {
     if (baskets < ACPCM4_BASKETS_MIN || baskets > ACPCM4_MAX_BUCKETS)
         return ERR_RANGE;
-    return acpcm_encode_impl(path, p, bits, 0, ACP2_NEVER, false, 0, baskets);
+    return acpcm_encode_impl(path, p, bits, 0, ACP2_NEVER, false, 0, baskets,
+                             false, 0.0, 0.0);
+}
+
+Err acpcm_encode5(const char* path, const pcm_buf* p, uint16_t bits,
+                  double e, double err)
+{
+    if (!(e > 1.0) || !(e == e))
+        return ERR_RANGE;
+    if (!(err >= ACPCM5_ERR_MIN) || !(err <= ACPCM5_ERR_MAX))
+        return ERR_RANGE;
+    return acpcm_encode_impl(path, p, bits, 0, ACP2_NEVER, false, 0, 0,
+                             true, e, err);
 }
 
 Err acpcm_file_info(const char* path, acpcm_info* out)
@@ -983,11 +1109,13 @@ Err acpcm_file_info(const char* path, acpcm_info* out)
         (memcmp(mag, ACPCM_MAGIC, 4) != 0 &&
          memcmp(mag, ACPCM_MAGIC2, 4) != 0 &&
          memcmp(mag, ACPCM_MAGIC3, 4) != 0 &&
-         memcmp(mag, ACPCM_MAGIC4, 4) != 0)) {
+         memcmp(mag, ACPCM_MAGIC4, 4) != 0 &&
+         memcmp(mag, ACPCM_MAGIC5, 4) != 0)) {
         fclose(f);
         return ERR_BAD_NOFFT;
     }
-    int fmt = (memcmp(mag, ACPCM_MAGIC4, 4) == 0) ? 3
+    int fmt = (memcmp(mag, ACPCM_MAGIC5, 4) == 0) ? 4
+            : (memcmp(mag, ACPCM_MAGIC4, 4) == 0) ? 3
             : (memcmp(mag, ACPCM_MAGIC3, 4) == 0) ? 2
             : (memcmp(mag, ACPCM_MAGIC2, 4) == 0) ? 1 : 0;
     int v2 = (fmt == 1);
@@ -1058,8 +1186,9 @@ struct DecChan {
     int32_t lim;
     int classes;   /* NFA3: basket alphabet size, bits+1 */
     int ctx;       /* NFA3: previous sample's basket, the histogram row */
-    int fmt;       /* 0: NFA1, 1: NFA2, 2: NFA3, 3: NFA4 */
+    int fmt;       /* 0: NFA1, 1: NFA2, 2: NFA3, 3: NFA4, 4: NFA5 */
     bool primed;
+    int32_t last_q;      /* last residual code (fmt 0/1), for acpcm_extract_codes */
     uint32_t block_len;  /* 0: NFA1/NFA3/NFA4, no flags */
     uint32_t in_block;   /* samples since the last boundary */
 
@@ -1069,6 +1198,12 @@ struct DecChan {
     int64_t factor4;    /* bt4.M - 1, baskets across the shifted range */
     int64_t peak4;      /* shifted channel range peak_q */
     int32_t base4;      /* signed grid offset on the 1/32768 scale */
+
+    /* NFA5: the multiplicative grid.  f5 is the fixed-point step table shared
+       with the encoder; the sample loop is integer only. */
+    std::vector<uint64_t> f5;
+    int32_t kmax5;
+    int32_t u5;      /* current reconstructed position on the shifted grid */
 
     Err init(const uint8_t* d, size_t n, uint16_t bits, uint32_t bl, int fmt)
     {
@@ -1083,6 +1218,8 @@ struct DecChan {
         this->fmt = fmt;
         if (fmt == 3)
             return init4(bits);
+        if (fmt == 4)
+            return init5();
 
         uint32_t peak_q = rc.fixed(16);
         int32_t mean_q = (int32_t)(int16_t)(uint16_t)rc.fixed(16);
@@ -1108,6 +1245,7 @@ struct DecChan {
 
         double x0 = (double)(int32_t)(int16_t)(uint16_t)rc.fixed(16) / 32768.0;
         xh = x0;
+        last_q = 0;
         primed = false;
         return ERR_OK;
     }
@@ -1137,12 +1275,56 @@ struct DecChan {
         return ERR_OK;
     }
 
+    /* NFA5 chunk: the codec's two doubles (e and err) and a raw 16 bit seed.
+       The step table is rebuilt from the decoded doubles, so encoder and
+       decoder share it exactly.  The first sample is the seed, every later one
+       is a K symbol. */
+    Err init5()
+    {
+        uint32_t hi = rc.fixed(32);
+        uint32_t lo = rc.fixed(32);
+        uint64_t ebits = ((uint64_t)hi << 32) | (uint64_t)lo;
+        double ebase;
+        memcpy(&ebase, &ebits, sizeof(ebase));
+        hi = rc.fixed(32);
+        lo = rc.fixed(32);
+        uint64_t rbits = ((uint64_t)hi << 32) | (uint64_t)lo;
+        double err;
+        memcpy(&err, &rbits, sizeof(err));
+
+        if (!(ebase > 1.0) || !(ebase == ebase) ||
+            !(err >= ACPCM5_ERR_MIN) || !(err <= ACPCM5_ERR_MAX))
+            return ERR_BAD_NOFFT;
+
+        build_grid5(ebase, err, &kmax5, &f5);
+
+        sym_init(&m);
+        int32_t xq0 = (int32_t)(int16_t)(uint16_t)rc.fixed(16);
+        u5 = xq0 + ACPCM5_OFFSET;
+        block_len = 0;
+        in_block = 0;
+        primed = false;   /* NFA5 codes a seed sample first */
+        return ERR_OK;
+    }
+
     double next()
     {
         if (!primed) {
             primed = true;
             in_block = 1;
+            if (fmt == 4)
+                return (double)(u5 - ACPCM5_OFFSET) / 32768.0;
             return xh * peak + mean;
+        }
+        if (fmt == 4) {
+            int32_t K = dec_sym(&rc, &m);
+            if (K > kmax5)
+                K = kmax5;
+            if (K < -kmax5)
+                K = -kmax5;
+            u5 = grid5_step(u5, f5[(size_t)(K + kmax5)]);
+            in_block++;
+            return (double)(u5 - ACPCM5_OFFSET) / 32768.0;
         }
         if (fmt == 3) {
             int b = rc.multi_tree(&bt4);
@@ -1199,6 +1381,7 @@ struct DecChan {
             q = lim - 1;
         if (q < -lim)
             q = -lim;
+        last_q = q;
         double pred = a1 * xh;
         xh = pred + (double)q * step;
         in_block++;
@@ -1304,6 +1487,70 @@ Err acpcm_dec_read(AcpcmDecoder* d, float* out, size_t max_frames, size_t* got)
         d->pos++;
     }
     *got = done;
+    return ERR_OK;
+}
+
+void acpcm_codes_free(acpcm_codes* c)
+{
+    if (c == NULL)
+        return;
+    free(c->q);
+    memset(c, 0, sizeof(*c));
+}
+
+/* Walk the same channel streams acpcm_dec_read does, frame by frame, but keep
+   the residual symbol each channel emits instead of the reconstructed sample.
+   The filter state (a1, xh, step) never feeds back into which symbol is read,
+   so skipping the reconstruction cannot drift; the NFA2 refit flags are still
+   consumed because DecChan::next() reads them. */
+Err acpcm_extract_codes(const char* path, acpcm_codes* out)
+{
+    if (path == NULL || out == NULL)
+        return ERR_BAD_ARGS;
+    memset(out, 0, sizeof(*out));
+
+    AcpcmDecoder* d = NULL;
+    Err e = acpcm_dec_open(path, &d);
+    if (e != ERR_OK)
+        return e;
+
+    if (d->info.format > 1) {
+        acpcm_dec_close(d);
+        return ERR_UNSUPPORTED_FMT;
+    }
+
+    size_t ch = d->info.channels;
+    size_t frames = d->frames;
+    size_t codes = (frames > 0) ? frames - 1 : 0;
+
+    int32_t* q = NULL;
+    if (ch != 0 && codes != 0) {
+        if (ch > SIZE_MAX / codes ||
+            ch * codes > SIZE_MAX / sizeof(int32_t)) {
+            acpcm_dec_close(d);
+            return ERR_NO_MEMORY;
+        }
+        q = (int32_t*)malloc(ch * codes * sizeof(int32_t));
+        if (q == NULL) {
+            acpcm_dec_close(d);
+            return ERR_NO_MEMORY;
+        }
+    }
+
+    for (size_t i = 0; i < frames; i++) {
+        for (size_t c = 0; c < ch; c++) {
+            d->ch[c].next();
+            if (i > 0 && q != NULL)
+                q[c * codes + (i - 1)] = d->ch[c].last_q;
+        }
+    }
+
+    acpcm_dec_close(d);
+
+    out->channels = (uint32_t)ch;
+    out->frames = (uint64_t)frames;
+    out->codes = (uint64_t)codes;
+    out->q = q;
     return ERR_OK;
 }
 

@@ -29,6 +29,7 @@ out.nfa1.nadc     sample-domain DPCM
 out.nfa2.nadc     block-refit predictor
 out.nfa3.nadc     residual baskets
 out.nfa4.nadc     basket-only
+out.nfa5.nadc     multiplicative, lossy
 ```
 
 and prints one summary line per file followed by a byte total.
@@ -42,6 +43,7 @@ and prints one summary line per file followed by a byte total.
 | `nfa2` | block-refit predictor | `NFA2` | `.nadc` | [nfa2.md](./nfa2.md) |
 | `nfa3` | residual baskets | `NFA3` | `.nadc` | [nfa3.md](./nfa3.md) |
 | `nfa4` | basket-only | `NFA4` | `.nadc` | [nfa4.md](./nfa4.md) |
+| `nfa5` | multiplicative, lossy | `NFA5` | `.nadc` | [nfa5.md](./nfa5.md) |
 
 `convert-all` names its files `<prefix>.<algo>.<ext>`, for example
 `out.nfa3.nadc`. `convert` writes to the exact path you give it. Existing
@@ -50,9 +52,10 @@ output files are overwritten.
 ## `convert`: one codec
 
 ```
-nofft convert <in> <out> [-algo poly|nfa1|nfa2|nfa3|nfa4]
-             [frame_len] [degree] [f32|f16] [interp|least-sq]   (poly)
-             [-bits N] [-block N] [-policy ...] [-s N | -b N]   (nfa*)
+nofft convert <in> <out> [-algo poly|nfa1|nfa2|nfa3|nfa4|nfa5]
+             [frame_len] [degree] [f32|f16] [interp|least-sq]    (poly)
+             [-bits N] [-block N] [-policy ...] [-s N | -b N]    (nfa*)
+             [-set-e X] [-set-err X]                             (nfa5)
 ```
 
 `-algo` defaults to `poly`, and the polynomial codec keeps its historical
@@ -64,6 +67,7 @@ nofft convert song.mp3 song.nfa1.nadc -algo nfa1 -bits 6
 nofft convert song.mp3 song.nfa2.nadc -algo nfa2 -block 1024 -policy drift
 nofft convert song.mp3 song.nfa3.nadc -algo nfa3 -bits 6
 nofft convert song.mp3 song.nfa4.nadc -algo nfa4 -b 170
+nofft convert song.mp3 song.nfa5.nadc -algo nfa5 -set-e 2 -set-err 0.005
 ```
 
 The `nfa*` algorithms take flags, not the polynomial positional arguments; a
@@ -75,9 +79,10 @@ bare number after `<out>` is rejected for them.
 nofft convert-all <in> <out-prefix>
                  [frame_len] [degree] [f32|f16] [interp|least-sq]
                  [-bits N] [-block N] [-policy ...] [-s N | -b N]
+                 [-set-e X] [-set-err X]
 ```
 
-It takes the same flags as `convert`, minus `-algo`, and writes all five files
+It takes the same flags as `convert`, minus `-algo`, and writes all six files
 in one decode. A failure on one algorithm is reported and the rest still run;
 the exit status is non-zero if any failed.
 
@@ -94,12 +99,14 @@ nofft convert-all song.mp3 out 32 5 f16 least-sq -block 512 -policy always
 
 | Flag | Applies to | Meaning |
 | --- | --- | --- |
-| `-algo name` | `convert` | `poly` (default), `nfa1`, `nfa2`, `nfa3` or `nfa4` |
+| `-algo name` | `convert` | `poly` (default), `nfa1`, `nfa2`, `nfa3`, `nfa4` or `nfa5` |
 | `-bits N` | `nfa*` | quantiser width, 2..24 (default 6) |
 | `-block N` | `nfa2` | refit window in frames, >= 1 (default 1024) |
 | `-policy p` | `nfa2` | `never`, `always` or `drift` (default `drift`) |
 | `-s N` | `nfa4` | basket grid as a step percent (default 5); above 100 the grid collapses to a single basket |
 | `-b N` | `nfa4` | exact basket count, 1..256 (for example 170); mutually exclusive with `-s` |
+| `-set-e X` | `nfa5` | ratio base, finite and > 1 (default 2) |
+| `-set-err X` | `nfa5` | log-domain step of the ratio, 5e-4..1 (default 0.01) |
 | `[frame_len]` | `poly` | frames per block (default 20) |
 | `[degree]` | `poly` | polynomial degree (default 3) |
 | `[f32\|f16]` | `poly` | coefficient format (default f32) |
@@ -115,7 +122,9 @@ Conversion is mechanical and correct, but the family is lossy and MP3 is not the
 material the polynomial codec likes: its reconstruction can be noisier than the
 source on broadband content. See
 [nofft.md](./nofft.md#what-mp3-cannot-be-represented-by). The acpcm algorithms
-(`nfa1` through `nfa4`) generally do far better and are the ones to reach for.
+(`nfa1` through `nfa5`) generally do far better and are the ones to reach for.
+Note that NFA5 is deliberately lossy even in principle, so it is the one to
+treat as a size/quality experiment rather than an archive step.
 As with any lossy step, check before converting an archive.
 
 ## Exit status

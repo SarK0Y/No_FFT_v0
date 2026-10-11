@@ -8,6 +8,7 @@ This README covers **NFA2** and the MP3 converter. For the other algorithms, see
 - [NFA1: sample-domain DPCM with a range coder](./docs/nfa1.md)
 - [NFA3: residual baskets](./docs/nfa3.md)
 - [NFA4: basket-only, no predictor](./docs/nfa4.md)
+- [NFA5: multiplicative (log-domain) predictor, lossy](./docs/nfa5.md)
 - [No_FFT: polynomial-fit codec](./docs/nofft.md)
 
 ## Build
@@ -34,17 +35,20 @@ nofft convert-all song.mp3 out
 # out.nfa2.nadc     block-refit predictor
 # out.nfa3.nadc     residual baskets
 # out.nfa4.nadc     basket-only
+# out.nfa5.nadc     multiplicative, lossy
 ```
 
 `convert` writes a single codec selected with `-algo`. The two commands share
 their flags: `-bits N` sets the acpcm quantiser width (default 6); `-block N`
 and `-policy never|always|drift` shape NFA2; `-s N` or `-b N` shape NFA4 (a
-step percent or an exact basket count, e.g. 170). `-algo poly` keeps the
-historical polynomial positional arguments.
+step percent or an exact basket count, e.g. 170); `-set-e X` and `-set-err X`
+shape NFA5 (base and log-domain quantum, default 2 and 0.01). `-algo poly` keeps
+the historical polynomial positional arguments.
 
 ```sh
 nofft convert song.mp3 song.no_fft -algo poly 20 4 f16
 nofft convert song.mp3 song.nfa3.nadc -algo nfa3 -bits 6
+nofft convert song.mp3 song.nfa5.nadc -algo nfa5 -set-err 0.005
 nofft convert-all song.mp3 out -b 170          # NFA4 with 170 baskets
 ```
 
@@ -162,4 +166,4 @@ Donations: [https://boosty.to/alg0z/donate](https://boosty.to/alg0z/donate) [htt
 
 # Project has been assisted w/ awesome OpenCode 🙂
 
-# my the Best Wishes to You 🙃
+# my the Best Wishes to You, Dear User 🙃

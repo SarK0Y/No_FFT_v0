@@ -63,6 +63,18 @@
  * transmitted.  The decoder rebuilds the basket midpoint and returns
  * (base_q + mid) / 32768.  A flat channel has peak_q == 0 and decodes exactly.
  * The fixed header is the NFA1 20 byte layout (format 3, block_len 0).
+ *
+ * NFA5 (magic "NFA5") is the multiplicative, log-domain predictor.  Instead of
+ * coding a difference against the previous sample it codes the *ratio*:
+ * u[n] = u[n-1] * e^(K[n]*err), where u = xq + ACPCM5_OFFSET is shifted onto a
+ * strictly positive grid so the ratio is always defined.  K is the only symbol
+ * per sample; e (base) and err (log-domain quantum of the ratio) travel in the
+ * chunk header as IEEE-754 doubles, so the decoder rebuilds the same step
+ * table.  The table F[K] = round(e^(K*err) * 2^16) is built once on each side
+ * from the decoded doubles, so the sample loop is integer only.  The coding is
+ * lossy by construction: the geometric grid cannot hit every integer, so a
+ * round trip is one quantiser step away, not bit exact.  The fixed header is
+ * the NFA1 20 byte layout (format 4, block_len 0).
  */
 
 #include <stdint.h>
@@ -74,6 +86,7 @@
 #define ACPCM_MAGIC2        "NFA2"
 #define ACPCM_MAGIC3        "NFA3"
 #define ACPCM_MAGIC4        "NFA4"
+#define ACPCM_MAGIC5        "NFA5"
 #define ACPCM_FIXED_HEADER  20
 #define ACPCM_FIXED_HEADER2 24
 #define ACPCM_BITS_MIN      2
@@ -88,6 +101,19 @@
 #define ACPCM4_STEP_MIN     1
 #define ACPCM4_STEP_MAX     65535
 
+/* NFA5: multiplicative (log-domain) predictor.  u = xq + offset is the shifted,
+   strictly positive grid the ratio lives on; the offset is one past 32768 so no
+   sample ever lands on u = 0, where the recurrence could not leave.  `err` is
+   the log-domain quantum of the per-step ratio e^err, so the grid is geometric
+   and the codec is lossy.  ACPCM5_MAX_STEPS caps the |K| table; the smallest
+   accepted err (with e > 1) therefore still has to span the whole grid. */
+#define ACPCM5_OFFSET      32769
+#define ACPCM5_MAX_STEPS   32768
+#define ACPCM5_E_DEFAULT   2.0
+#define ACPCM5_ERR_DEFAULT 0.01
+#define ACPCM5_ERR_MIN     5e-4
+#define ACPCM5_ERR_MAX     1.0
+
 /* NFA2: when does the encoder refit a1 at a block boundary?  NEVER keeps the
    stream bit identical to NFA1 (flags all zero); the refit itself is decided
    encoder side, the decoder only reads what was sent. */
@@ -101,12 +127,24 @@ typedef struct {
     uint16_t bits;       /* quantiser width actually used */
     uint32_t channels;
     uint32_t sample_rate;
-    uint32_t block_len;  /* NFA2 block length in frames, 0 for NFA1/NFA3/NFA4 */
-    uint8_t  format;     /* 0: NFA1, 1: NFA2, 2: NFA3, 3: NFA4 */
+    uint32_t block_len;  /* NFA2 block length in frames, 0 for NFA1/NFA3/NFA4/NFA5 */
+    uint8_t  format;     /* 0: NFA1, 1: NFA2, 2: NFA3, 3: NFA4, 4: NFA5 */
     uint64_t frames;     /* frames per channel */
     uint64_t payload;    /* bytes of range coded payload */
     uint64_t total;      /* whole file size */
 } acpcm_info;
+
+/* The replacement codes an NFA1 (or NFA2) chunk actually transmits: the
+   quantised residual symbol q of every frame after the first, per channel.
+   The first sample of a chunk is a raw 16 bit seed, not a symbol, so it has no
+   code and is absent from the sequence.  Filled by acpcm_extract_codes, which
+   decodes the range coded symbols only and reconstructs no audio. */
+typedef struct {
+    uint32_t channels;
+    uint64_t frames;   /* frames per channel, from the container */
+    uint64_t codes;    /* codes per channel: frames - 1 (0 when frames <= 1) */
+    int32_t* q;        /* channels * codes, channel major; NULL when codes == 0 */
+} acpcm_codes;
 
 /* p->samples is interleaved.  `bits` outside ACPCM_BITS_MAX..ACPCM_BITS_MAX is
    rejected with ERR_RANGE. */
@@ -142,10 +180,29 @@ Err acpcm_encode4(const char* path, const pcm_buf* p, uint16_t bits,
 Err acpcm_encode4_baskets(const char* path, const pcm_buf* p, uint16_t bits,
                           uint32_t baskets);
 
+/* NFA5, the multiplicative (log-domain) predictor: the only symbol per sample
+   is K, the integer multiple of `err` in S[n] = S[n-1] * e^(K*err) on the
+   shifted, strictly positive grid u = xq + ACPCM5_OFFSET.  `e` (base) and `err`
+   (log-domain quantum) are stored as doubles in every chunk, so the decoder
+   rebuilds the same fixed-point step table.  This codec is lossy: the geometric
+   grid cannot reproduce every integer sample.  `e` must be > 1 and finite; `err`
+   must be in ACPCM5_ERR_MIN..ACPCM5_ERR_MAX; anything else is ERR_RANGE.  `bits`
+   is stored in the header but does not affect the grid. */
+Err acpcm_encode5(const char* path, const pcm_buf* p, uint16_t bits,
+                  double e, double err);
+
 Err acpcm_decode(const char* path, pcm_buf* out);
 
 /* Header only, no decoding. */
 Err acpcm_file_info(const char* path, acpcm_info* out);
+
+/* Decodes the residual symbols of an NFA1 (or NFA2) stream into `out` without
+   rebuilding the samples; the refit flags NFA2 codes are consumed so the two
+   sides stay in step.  NFA3/NFA4/NFA5 carry no single residual symbol and are
+   rejected with ERR_UNSUPPORTED_FMT.  Release the result with
+   acpcm_codes_free. */
+Err acpcm_extract_codes(const char* path, acpcm_codes* out);
+void acpcm_codes_free(acpcm_codes* c);
 
 /* ---- streaming decode ----
  *
