@@ -88,3 +88,26 @@ more on the way out shifts the gain by one LSB, and because the filter is
 recursive the two sides never resynchronise, so the damage runs to the last
 sample. And `a1` is held at or below 0.999, since the pole of `1/(1 - a1 z^-1)`
 is `a1` and anything above 1 diverges in closed loop.
+
+## Reading the residual codes back
+
+The library exposes the symbol stream itself: `acpcm_extract_codes` decodes the
+range-coded payload of an NFA1 or NFA2 file into the per-frame residual codes
+`q` — one `int32` per frame after the seed sample, per channel — without
+rebuilding any audio. This is the `q[n]` of the recurrence above, so it is the
+input a different back end could resynthesise from; the NFA2 refit flags are
+still consumed, so the two sides stay in step even though no sample is filtered.
+
+```c
+acpcm_codes c;
+if (acpcm_extract_codes("song.nadc", &c) == ERR_OK) {
+    /* c.q[c.codes * channel + n] is q[n+1] of that channel */
+    acpcm_codes_free(&c);
+}
+```
+
+The seed sample, being a raw 16-bit value rather than a symbol, has no code and
+is absent, so `codes == frames - 1`. NFA3 and NFA4 carry no single residual
+symbol (a basket index, or a basket plus mantissa and escapes), so they are
+rejected with `ERR_UNSUPPORTED_FMT`.
+

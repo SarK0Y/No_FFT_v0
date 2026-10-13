@@ -1,0 +1,96 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>NFA1 notes — range coder</title>
+<style>
+  body { max-width: 52rem; margin: 2rem auto; padding: 0 1rem;
+         font: 16px/1.55 -apple-system, Segoe UI, Roboto, Helvetica, Arial, sans-serif;
+         color: #1a1a1a; }
+  h1 { font-size: 1.4rem; border-bottom: 1px solid #ddd; padding-bottom: .3rem; }
+  code, pre { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+  code { background: #f3f3f3; padding: .1em .3em; border-radius: 3px; font-size: .92em; }
+  pre { background: #f6f8fa; padding: .75rem 1rem; border-radius: 6px; overflow-x: auto;
+        font-size: .88em; line-height: 1.45; }
+  table { border-collapse: collapse; margin: 1rem 0; width: 100%; }
+  th, td { border: 1px solid #ddd; padding: .4rem .6rem; text-align: left; vertical-align: top; }
+  th { background: #f3f3f3; }
+  ul { padding-left: 1.25rem; }
+  li { margin: .35rem 0; }
+  .lead { font-weight: 600; }
+</style>
+</head>
+<body>
+
+<h1>NFA1 notes — the entropy engine</h1>
+
+<p class="lead">Right — it's a <strong>range coder</strong> (the LZMA-style carryless binary arithmetic
+coder), and the "uint32" is specifically the interval width.</p>
+
+<p>The exact state (<code>acpcm.cpp:175–221</code>):</p>
+
+<table>
+<thead>
+<tr><th>field</th><th>type</th><th>role</th></tr>
+</thead>
+<tbody>
+<tr><td><code>range</code></td><td><code>uint32_t</code></td>
+    <td>interval width; starts <code>0xFFFFFFFF</code>, stays in <code>[2^24, 2^32)</code></td></tr>
+<tr><td><code>low</code></td><td><code>uint64_t</code></td>
+    <td>interval base; 64-bit only so a carry can push into bit 32</td></tr>
+<tr><td><code>cache</code>, <code>cache_size</code></td><td><code>uint8_t</code>, <code>int64_t</code></td>
+    <td>delay/buffer emitted bytes until the carry is resolved</td></tr>
+<tr><td><code>code</code> (decode)</td><td><code>uint32_t</code></td>
+    <td>the offset within the current interval</td></tr>
+</tbody>
+</table>
+
+<p>So "uint32 arithmetic coding" is accurate for the interval (<code>range</code>/<code>code</code>),
+but the encoder's accumulator is 64-bit. It's not big-integer arithmetic coding — everything is
+32-bit-ish and byte-renormalized.</p>
+
+<p>How the pieces fit:</p>
+
+<ul>
+<li><strong>Probabilities are 11-bit</strong>: total 2048, <code>RC_PROB_INIT = 1024</code>.
+    <code>bound = (range &gt;&gt; 11) * p</code> — one multiply and a shift, which is why it's
+    "uint32-friendly."</li>
+
+<li><strong>Renormalization is base-256</strong>: <code>RC_TOP = 1 &lt;&lt; 24</code>. Whenever
+    <code>range</code> drops below it, one byte is shifted out and <code>range &lt;&lt;= 8</code>.
+    That leaves 8 bits of headroom so the next <code>range &gt;&gt; 11</code> product can't overflow a
+    <code>uint32</code>.</li>
+
+<li><strong>Carry handling</strong>: <code>low</code> is <code>uint64_t</code> and
+    <code>rc_shift_low</code> inspects bit 32 (<code>(uint32_t)(low &gt;&gt; 32)</code>) to carry into
+    buffered bytes — the classic scheme that avoids the expensive "renormalize with carry
+    propagation" of textbook arithmetic coding. <code>cache_size</code> is how many
+    <code>0xFF</code> bytes are pending.</li>
+
+<li><strong>Flush is a fixed 5 shift-lows</strong> (<code>rc_flush</code>), which is why the
+    10-decision example produced 6 bytes — 1 real + 5 tail.</li>
+
+<li><strong>Two symbol flavors on the same coder</strong>:
+    <ul>
+    <li>binary (<code>EncCtx::bit</code> / <code>DecCtx::bit</code>) with an adaptive 11-bit
+        <code>uint16_t</code> probability;</li>
+    <li>multi-symbol (<code>rc_enc_multi</code> / <code>DecCtx::multi</code> /
+        <code>multi_tree</code>) with a cumulative-frequency table,
+        <code>P(sym) = (cnt[sym]+1)/(tot+M)</code>, using 64-bit products to avoid overflow.
+        NFA4 stays byte-identical because <code>multi_tree</code> computes the <em>same</em> floor
+        products via the Fenwick tree.</li>
+    </ul>
+</li>
+
+<li><strong><code>fixed(v, n)</code></strong> codes <code>n</code> raw bits with a
+    <code>uint16_t p</code> that starts at 1024 <em>within that call</em> — so for
+    <code>n = 1</code> it's exactly one equiprobable bit (the mantissa case), while header fields
+    (16/32-bit) get a mild adaptive model over their own bits.</li>
+</ul>
+
+<p>So: a 32-bit, byte-renormalizing, carry-cached range coder with 11-bit adaptive binary models and
+an optional cumulative multi-symbol interface. That's the whole entropy engine; NFA1–NFA4 differ only
+in the models/symbols fed into it.</p>
+
+</body>
+</html>

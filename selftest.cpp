@@ -975,6 +975,525 @@ static void test_nfa4(int verbose)
     pcm_free(&o4);
 }
 
+/* NFA5: the multiplicative (log-domain) predictor.  Unlike NFA1-4 it is lossy
+   by construction, since a geometric grid cannot hit every integer, so the
+   checks are quality bounds rather than equality: a finer err must buy SNR and
+   cost rate, a flat signal is exact (K = 0 on every step), a one frame chunk
+   is just the seed, and the flags are validated before anything is written. */
+static void test_nfa5(int verbose)
+{
+    const size_t frames = 12000;
+    pcm_buf in, o5;
+    char det[192];
+    double bps5 = 0.0, snr5 = 0.0;
+
+    memset(&in, 0, sizeof(in));
+    memset(&o5, 0, sizeof(o5));
+    in.count = frames * 2;          /* stereo, exercises per-channel grids */
+    in.channels = 2;
+    in.sample_rate = 44100;
+    in.samples = (float*)malloc(in.count * sizeof(float));
+    if (in.samples == NULL)
+        return;
+
+    rng_seed(0x5A5Au);
+    for (size_t i = 0; i < frames; i++) {
+        in.samples[2 * i + 0] = (float)(0.6 * sin(2.0 * 3.14159265358979 *
+                                                  440.0 * (double)i / 44100.0));
+        in.samples[2 * i + 1] = 0.3f * rng_next();
+    }
+
+    char path[512];
+    temp_path(path, sizeof(path), "n5");
+    Err e = acpcm_encode5(path, &in, 16, 2.0, 0.01);
+    if (e == ERR_OK) {
+        acpcm_info info;
+        memset(&info, 0, sizeof(info));
+        if (acpcm_file_info(path, &info) == ERR_OK && info.frames != 0) {
+            bps5 = 8.0 * (double)info.payload /
+                   ((double)info.frames * (double)info.channels);
+            snprintf(det, sizeof(det), "format=%u block=%u (want 4 and 0)",
+                     (unsigned)info.format, (unsigned)info.block_len);
+            check(info.format == 4 && info.block_len == 0, verbose,
+                  "nfa5 file reports format 4, block 0", det);
+        }
+        e = acpcm_decode(path, &o5);
+    }
+    if (e != ERR_OK || o5.count != in.count) {
+        snprintf(det, sizeof(det), "%s", g_err_str(e));
+        check(0, verbose, "nfa5 round trips", det);
+        pcm_free(&in);
+        pcm_free(&o5);
+        return;
+    }
+    snr5 = (double)nofft_decode_snr_db(in.samples, o5.samples, in.count);
+    snprintf(det, sizeof(det), "snr=%.2f dB, %.4f b/sample", snr5, bps5);
+    check(snr5 >= 25.0, verbose, "nfa5 codes the log grid", det);
+
+    /* a finer log step must buy fidelity on the same signal */
+    {
+        pcm_buf fine, coarse;
+        double snr_fine = -99.0, snr_coarse = -99.0;
+        char p1[512], p2[512];
+        memset(&fine, 0, sizeof(fine));
+        memset(&coarse, 0, sizeof(coarse));
+        temp_path(p1, sizeof(p1), "n5a");
+        temp_path(p2, sizeof(p2), "n5b");
+        if (acpcm_encode5(p1, &in, 16, 2.0, 0.001) == ERR_OK &&
+            acpcm_decode(p1, &fine) == ERR_OK && fine.count == in.count)
+            snr_fine = (double)nofft_decode_snr_db(in.samples, fine.samples,
+                                                   in.count);
+        if (acpcm_encode5(p2, &in, 16, 2.0, 0.05) == ERR_OK &&
+            acpcm_decode(p2, &coarse) == ERR_OK && coarse.count == in.count)
+            snr_coarse = (double)nofft_decode_snr_db(in.samples, coarse.samples,
+                                                     in.count);
+        remove(p1);
+        remove(p2);
+        snprintf(det, sizeof(det), "err=0.001 %.2f dB vs err=0.05 %.2f dB",
+                 snr_fine, snr_coarse);
+        check(snr_fine > snr_coarse + 10.0, verbose,
+              "nfa5 finer err improves fidelity", det);
+        pcm_free(&fine);
+        pcm_free(&coarse);
+    }
+
+    /* flat signals are exact: u never changes, so every K is 0 */
+    {
+        static const float vals[] = { 0.0f, 0.75f };
+        for (size_t k = 0; k < sizeof(vals) / sizeof(vals[0]); k++) {
+            pcm_buf fi, fo;
+            Err fe;
+            memset(&fi, 0, sizeof(fi));
+            memset(&fo, 0, sizeof(fo));
+            fi.count = 4096;
+            fi.channels = 1;
+            fi.sample_rate = 44100;
+            fi.samples = (float*)malloc(fi.count * sizeof(float));
+            if (fi.samples == NULL)
+                break;
+            for (size_t i = 0; i < fi.count; i++)
+                fi.samples[i] = vals[k];
+            char fp[512];
+            temp_path(fp, sizeof(fp), "n5f");
+            fe = acpcm_encode5(fp, &fi, 16, 2.0, 0.01);
+            if (fe == ERR_OK)
+                fe = acpcm_decode(fp, &fo);
+            remove(fp);
+            check(fe == ERR_OK && fo.count == fi.count && same(&fi, &fo),
+                  verbose, vals[k] == 0.0f ? "silence exact in nfa5"
+                                           : "dc exact in nfa5", NULL);
+            pcm_free(&fi);
+            pcm_free(&fo);
+        }
+    }
+
+    /* a one frame chunk is the seed and nothing else */
+    {
+        pcm_buf one, back;
+        Err fe;
+        memset(&one, 0, sizeof(one));
+        memset(&back, 0, sizeof(back));
+        one.count = 1;
+        one.channels = 1;
+        one.sample_rate = 44100;
+        one.samples = (float*)malloc(sizeof(float));
+        if (one.samples != NULL) {
+            one.samples[0] = 0.5f;
+            temp_path(path, sizeof(path), "n5o");
+            fe = acpcm_encode5(path, &one, 16, 2.0, 0.01);
+            if (fe == ERR_OK)
+                fe = acpcm_decode(path, &back);
+            remove(path);
+            check(fe == ERR_OK && back.count == 1 && same(&one, &back), verbose,
+                  "nfa5 one frame is just the seed", NULL);
+            pcm_free(&back);
+        }
+        pcm_free(&one);
+    }
+
+    /* the auto-dial picks one global err from a target rate and round trips */
+    {
+        pcm_buf back;
+        double bps_a = 0.0, snr_a = -99.0;
+        memset(&back, 0, sizeof(back));
+        temp_path(path, sizeof(path), "n5au");
+        Err ae = acpcm_encode5_auto(path, &in, 16, 2.0, 2.0);
+        if (ae == ERR_OK) {
+            acpcm_info info;
+            memset(&info, 0, sizeof(info));
+            if (acpcm_file_info(path, &info) == ERR_OK && info.frames != 0)
+                bps_a = 8.0 * (double)info.payload /
+                        ((double)info.frames * (double)info.channels);
+            ae = acpcm_decode(path, &back);
+        }
+        if (ae == ERR_OK && back.count == in.count)
+            snr_a = (double)nofft_decode_snr_db(in.samples, back.samples,
+                                                in.count);
+        remove(path);
+        snprintf(det, sizeof(det), "snr=%.2f dB, %.4f b/sample", snr_a, bps_a);
+        check(ae == ERR_OK && back.count == in.count && bps_a > 0.5 &&
+              bps_a < 3.5 && snr_a > 5.0, verbose,
+              "nfa5 auto-dial round trips near its target", det);
+        pcm_free(&back);
+    }
+
+    /* the point of the auto-dial: a quiet signal must not collapse the way a
+       coarse err dialed by ear on loud material does */
+    {
+        pcm_buf quiet, qa, qc;
+        double snr_auto = -99.0, snr_coarse = -99.0, bps_auto = 0.0;
+        memset(&quiet, 0, sizeof(quiet));
+        memset(&qa, 0, sizeof(qa));
+        memset(&qc, 0, sizeof(qc));
+        quiet.count = 8820;
+        quiet.channels = 1;
+        quiet.sample_rate = 44100;
+        quiet.samples = (float*)malloc(quiet.count * sizeof(float));
+        if (quiet.samples != NULL) {
+            for (size_t i = 0; i < quiet.count; i++)
+                quiet.samples[i] = (float)(0.1 * sin(2.0 * 3.14159265358979 *
+                                                     440.0 * (double)i / 44100.0));
+            char pa[512], pc[512];
+            temp_path(pa, sizeof(pa), "n5qauto");
+            temp_path(pc, sizeof(pc), "n5qfix");
+            if (acpcm_encode5_auto(pa, &quiet, 16, 2.0, 2.0) == ERR_OK &&
+                acpcm_decode(pa, &qa) == ERR_OK && qa.count == quiet.count) {
+                snr_auto = (double)nofft_decode_snr_db(quiet.samples,
+                                                       qa.samples, quiet.count);
+                acpcm_info info;
+                memset(&info, 0, sizeof(info));
+                if (acpcm_file_info(pa, &info) == ERR_OK && info.frames != 0)
+                    bps_auto = 8.0 * (double)info.payload /
+                               ((double)info.frames * (double)info.channels);
+            }
+            if (acpcm_encode5(pc, &quiet, 16, 2.0, 0.18) == ERR_OK &&
+                acpcm_decode(pc, &qc) == ERR_OK && qc.count == quiet.count)
+                snr_coarse = (double)nofft_decode_snr_db(quiet.samples,
+                                                         qc.samples,
+                                                         quiet.count);
+            remove(pa);
+            remove(pc);
+            snprintf(det, sizeof(det),
+                     "auto %.2f dB (%.4f b/s) vs fixed err=0.18 %.2f dB",
+                     snr_auto, bps_auto, snr_coarse);
+            check(snr_auto > snr_coarse + 10.0, verbose,
+                  "nfa5 auto-dial rescues a quiet signal", det);
+            pcm_free(&qa);
+            pcm_free(&qc);
+        }
+        pcm_free(&quiet);
+    }
+
+    /* the auto-dial parameters are validated before any file is written */
+    expect_err(acpcm_encode5_auto(path, &in, 16, 1.0, 2.0), ERR_RANGE, verbose,
+               "nfa5 auto-dial rejects e <= 1");
+    expect_err(acpcm_encode5_auto(path, &in, 16, 2.0, 0.0), ERR_RANGE, verbose,
+               "nfa5 auto-dial rejects rate 0");
+    expect_err(acpcm_encode5_auto(path, &in, 16, 2.0, 65.0), ERR_RANGE, verbose,
+               "nfa5 auto-dial rejects rate above the maximum");
+
+    /* the parameters are validated before any file is written */
+    expect_err(acpcm_encode5(path, &in, 16, 1.0, 0.01), ERR_RANGE, verbose,
+               "nfa5 rejects e <= 1");
+    expect_err(acpcm_encode5(path, &in, 16, 0.5, 0.01), ERR_RANGE, verbose,
+               "nfa5 rejects e < 1");
+    expect_err(acpcm_encode5(path, &in, 16, 2.0, 0.0), ERR_RANGE, verbose,
+               "nfa5 rejects err 0");
+    expect_err(acpcm_encode5(path, &in, 16, 2.0, ACPCM5_ERR_MIN / 2.0),
+               ERR_RANGE, verbose, "nfa5 rejects err below the minimum");
+    expect_err(acpcm_encode5(path, &in, 16, 2.0, ACPCM5_ERR_MAX * 2.0),
+               ERR_RANGE, verbose, "nfa5 rejects err above the maximum");
+    expect_err(acpcm_encode5(path, &in, 0, 2.0, 0.01), ERR_RANGE, verbose,
+               "nfa5 rejects bits below the minimum");
+    in.samples[7] = 0.0f / 0.0f;   /* NaN */
+    expect_err(acpcm_encode5(path, &in, 16, 2.0, 0.01), ERR_BAD_INPUT, verbose,
+               "nfa5 rejects NaN samples");
+    in.samples[7] = 0.0f;
+
+    pcm_free(&in);
+    pcm_free(&o5);
+}
+
+static void test_nfa6(int verbose)
+{
+    const size_t frames = 12000;
+    pcm_buf in, o6;
+    char det[192];
+    double bps6 = 0.0, snr6 = 0.0;
+
+    memset(&in, 0, sizeof(in));
+    memset(&o6, 0, sizeof(o6));
+    in.count = frames * 2;          /* stereo, exercises per-channel grids */
+    in.channels = 2;
+    in.sample_rate = 44100;
+    in.samples = (float*)malloc(in.count * sizeof(float));
+    if (in.samples == NULL)
+        return;
+
+    rng_seed(0x6A6Au);
+    for (size_t i = 0; i < frames; i++) {
+        in.samples[2 * i + 0] = (float)(0.6 * sin(2.0 * 3.14159265358979 *
+                                                  440.0 * (double)i / 44100.0));
+        in.samples[2 * i + 1] = 0.3f * rng_next();
+    }
+
+    char path[512];
+    temp_path(path, sizeof(path), "n6");
+    Err e = acpcm_encode6(path, &in, 16, 256, 2.0, 2.6);
+    if (e == ERR_OK) {
+        acpcm_info info;
+        memset(&info, 0, sizeof(info));
+        if (acpcm_file_info(path, &info) == ERR_OK && info.frames != 0) {
+            bps6 = 8.0 * (double)info.payload /
+                   ((double)info.frames * (double)info.channels);
+            snprintf(det, sizeof(det), "format=%u block=%u (want 5 and 256)",
+                     (unsigned)info.format, (unsigned)info.block_len);
+            check(info.format == 5 && info.block_len == 256, verbose,
+                  "nfa6 file reports format 5 and its block", det);
+        }
+        e = acpcm_decode(path, &o6);
+    }
+    if (e != ERR_OK || o6.count != in.count) {
+        snprintf(det, sizeof(det), "%s", g_err_str(e));
+        check(0, verbose, "nfa6 round trips", det);
+        pcm_free(&in);
+        pcm_free(&o6);
+        return;
+    }
+    snr6 = (double)nofft_decode_snr_db(in.samples, o6.samples, in.count);
+    snprintf(det, sizeof(det), "snr=%.2f dB, %.4f b/sample", snr6, bps6);
+    check(snr6 >= 20.0, verbose, "nfa6 codes the log grid", det);
+
+    /* the per-block rate control must spend more on a higher target */
+    {
+        double bps_lo = 0.0, bps_hi = 0.0;
+        char p1[512], p2[512];
+        acpcm_info i1, i2;
+        temp_path(p1, sizeof(p1), "n6lo");
+        temp_path(p2, sizeof(p2), "n6hi");
+        memset(&i1, 0, sizeof(i1));
+        memset(&i2, 0, sizeof(i2));
+        if (acpcm_encode6(p1, &in, 16, 256, 2.0, 1.5) == ERR_OK &&
+            acpcm_file_info(p1, &i1) == ERR_OK && i1.frames != 0)
+            bps_lo = 8.0 * (double)i1.payload /
+                     ((double)i1.frames * (double)i1.channels);
+        if (acpcm_encode6(p2, &in, 16, 256, 2.0, 3.5) == ERR_OK &&
+            acpcm_file_info(p2, &i2) == ERR_OK && i2.frames != 0)
+            bps_hi = 8.0 * (double)i2.payload /
+                     ((double)i2.frames * (double)i2.channels);
+        remove(p1);
+        remove(p2);
+        snprintf(det, sizeof(det), "rate=1.5 %.4f vs rate=3.5 %.4f b/sample",
+                 bps_lo, bps_hi);
+        check(bps_hi > bps_lo + 0.2, verbose,
+              "nfa6 rate control spends more on a higher target", det);
+    }
+
+    /* flat signals are exact: u never changes, so every K is 0 */
+    {
+        static const float vals[] = { 0.0f, 0.75f };
+        for (size_t k = 0; k < sizeof(vals) / sizeof(vals[0]); k++) {
+            pcm_buf fi, fo;
+            Err fe;
+            memset(&fi, 0, sizeof(fi));
+            memset(&fo, 0, sizeof(fo));
+            fi.count = 4096;
+            fi.channels = 1;
+            fi.sample_rate = 44100;
+            fi.samples = (float*)malloc(fi.count * sizeof(float));
+            if (fi.samples == NULL)
+                break;
+            for (size_t i = 0; i < fi.count; i++)
+                fi.samples[i] = vals[k];
+            char fp[512];
+            temp_path(fp, sizeof(fp), "n6f");
+            fe = acpcm_encode6(fp, &fi, 16, 256, 2.0, 2.6);
+            if (fe == ERR_OK)
+                fe = acpcm_decode(fp, &fo);
+            remove(fp);
+            check(fe == ERR_OK && fo.count == fi.count && same(&fi, &fo),
+                  verbose, vals[k] == 0.0f ? "silence exact in nfa6"
+                                           : "dc exact in nfa6", NULL);
+            pcm_free(&fi);
+            pcm_free(&fo);
+        }
+    }
+
+    /* a one frame chunk is the seed and nothing else */
+    {
+        pcm_buf one, back;
+        Err fe;
+        memset(&one, 0, sizeof(one));
+        memset(&back, 0, sizeof(back));
+        one.count = 1;
+        one.channels = 1;
+        one.sample_rate = 44100;
+        one.samples = (float*)malloc(sizeof(float));
+        if (one.samples != NULL) {
+            one.samples[0] = 0.5f;
+            temp_path(path, sizeof(path), "n6o");
+            fe = acpcm_encode6(path, &one, 16, 256, 2.0, 2.6);
+            if (fe == ERR_OK)
+                fe = acpcm_decode(path, &back);
+            remove(path);
+            check(fe == ERR_OK && back.count == 1 && same(&one, &back), verbose,
+                  "nfa6 one frame is just the seed", NULL);
+            pcm_free(&back);
+        }
+        pcm_free(&one);
+    }
+
+    /* the parameters are validated before any file is written */
+    expect_err(acpcm_encode6(path, &in, 16, 0, 2.0, 2.6), ERR_RANGE, verbose,
+               "nfa6 rejects block 0");
+    expect_err(acpcm_encode6(path, &in, 16, 256, 1.0, 2.6), ERR_RANGE, verbose,
+               "nfa6 rejects e <= 1");
+    expect_err(acpcm_encode6(path, &in, 16, 256, 2.0, 0.0), ERR_RANGE, verbose,
+               "nfa6 rejects rate 0");
+    expect_err(acpcm_encode6(path, &in, 16, 256, 2.0, 65.0), ERR_RANGE, verbose,
+               "nfa6 rejects rate above the maximum");
+    expect_err(acpcm_encode6(path, &in, 0, 256, 2.0, 2.6), ERR_RANGE, verbose,
+               "nfa6 rejects bits below the minimum");
+    in.samples[7] = 0.0f / 0.0f;   /* NaN */
+    expect_err(acpcm_encode6(path, &in, 16, 256, 2.0, 2.6), ERR_BAD_INPUT,
+               verbose, "nfa6 rejects NaN samples");
+    in.samples[7] = 0.0f;
+
+    pcm_free(&in);
+    pcm_free(&o6);
+}
+
+
+
+static void test_extract(int verbose)
+{
+    char path[512];
+    char det[192];
+    const size_t frames = 4096;
+    const uint16_t ch = 2;
+
+    pcm_buf in;
+    memset(&in, 0, sizeof(in));
+    in.count = frames * ch;
+    in.channels = ch;
+    in.sample_rate = 44100;
+    in.samples = (float*)calloc(in.count, sizeof(float));
+    if (in.samples == NULL)
+        return;
+    rng_seed(1234);
+    for (size_t i = 0; i < in.count; i++) {
+        double t = (double)(i / ch) / 44100.0;
+        in.samples[i] = (float)(0.35 * sin(2.0 * 3.14159265358979 * 277.0 * t)) +
+                        rng_next();
+    }
+
+    temp_path(path, sizeof(path), "codes");
+    acpcm_codes c1;
+    memset(&c1, 0, sizeof(c1));
+    Err e = acpcm_encode(path, &in, 8);
+    if (e == ERR_OK)
+        e = acpcm_extract_codes(path, &c1);
+    int ok = (e == ERR_OK && c1.channels == ch && c1.frames == frames &&
+              c1.codes == frames - 1 && c1.q != NULL);
+    snprintf(det, sizeof(det), "%llu codes x %u ch, one per frame after seed",
+             (unsigned long long)(ok ? c1.codes : 0), c1.channels);
+    check(ok, verbose, "nfa1 residual codes extract", det);
+
+    /* the codes are the transmitted residual, so they must fit the quantiser */
+    int inrange = 1;
+    int nonzero = 0;
+    if (ok) {
+        int32_t lim = (int32_t)((1u << (8 - 1)) - 1u);
+        for (size_t i = 0; i < c1.channels * c1.codes; i++) {
+            if (c1.q[i] > lim - 1 || c1.q[i] < -lim)
+                inrange = 0;
+            if (c1.q[i] != 0)
+                nonzero = 1;
+        }
+    }
+    check(ok && inrange && nonzero, verbose, "codes are residual symbols",
+          inrange ? "all within the quantiser range" : "out of range");
+
+    /* NFA2 with refits disabled is bit identical to NFA1, so the codes match */
+    acpcm_codes c2;
+    memset(&c2, 0, sizeof(c2));
+    int same_codes = 0;
+    if (acpcm_encode2(path, &in, 8, 512, ACP2_NEVER) == ERR_OK &&
+        acpcm_extract_codes(path, &c2) == ERR_OK) {
+        same_codes = (c2.codes == c1.codes && c2.channels == c1.channels);
+        for (size_t i = 0; same_codes && i < c1.channels * c1.codes; i++)
+            if (c2.q[i] != c1.q[i])
+                same_codes = 0;
+    }
+    check(same_codes, verbose, "nfa2 never codes match nfa1", "");
+
+    /* a silent channel carries no residual at all */
+    int silent_ok = 0;
+    memset(in.samples, 0, in.count * sizeof(float));
+    if (acpcm_encode(path, &in, 8) == ERR_OK) {
+        acpcm_codes cs;
+        if (acpcm_extract_codes(path, &cs) == ERR_OK) {
+            silent_ok = (cs.codes == frames - 1);
+            for (size_t i = 0; silent_ok && i < cs.channels * cs.codes; i++)
+                if (cs.q[i] != 0)
+                    silent_ok = 0;
+            acpcm_codes_free(&cs);
+        }
+    }
+    check(silent_ok, verbose, "silence extracts all zero codes", "");
+
+    /* a one frame chunk is a seed and nothing else */
+    pcm_buf one;
+    memset(&one, 0, sizeof(one));
+    one.count = 1;
+    one.channels = 1;
+    one.sample_rate = 44100;
+    one.samples = (float*)calloc(1, sizeof(float));
+    int one_ok = 0;
+    if (one.samples != NULL && acpcm_encode(path, &one, 8) == ERR_OK) {
+        acpcm_codes cz;
+        if (acpcm_extract_codes(path, &cz) == ERR_OK) {
+            one_ok = (cz.codes == 0 && cz.frames == 1 && cz.q == NULL);
+            acpcm_codes_free(&cz);
+        }
+    }
+    check(one_ok, verbose, "one frame yields no codes", "");
+    pcm_free(&one);
+
+    /* NFA3..NFA6 have no single residual symbol */
+    int rej3 = 0, rej4 = 0, rej5 = 0, rej6 = 0;
+    if (acpcm_encode3(path, &in, 8) == ERR_OK) {
+        acpcm_codes cx;
+        rej3 = (acpcm_extract_codes(path, &cx) == ERR_UNSUPPORTED_FMT);
+        acpcm_codes_free(&cx);
+    }
+    if (acpcm_encode4_baskets(path, &in, 8, 32) == ERR_OK) {
+        acpcm_codes cx4;
+        rej4 = (acpcm_extract_codes(path, &cx4) == ERR_UNSUPPORTED_FMT);
+        acpcm_codes_free(&cx4);
+    }
+    if (acpcm_encode5(path, &in, 8, 2.0, 0.01) == ERR_OK) {
+        acpcm_codes cx1;
+        rej5 = (acpcm_extract_codes(path, &cx1) == ERR_UNSUPPORTED_FMT);
+        acpcm_codes_free(&cx1);
+    }
+    if (acpcm_encode6(path, &in, 8, 256, 2.0, 2.6) == ERR_OK) {
+        acpcm_codes cx2;
+        rej6 = (acpcm_extract_codes(path, &cx2) == ERR_UNSUPPORTED_FMT);
+        acpcm_codes_free(&cx2);
+    }
+    if (0) {
+        
+    }
+    check(rej3 && rej4 && rej5 && rej6, verbose,
+          "extract rejects nfa3, nfa4, nfa5, nfa6", "");
+
+    acpcm_codes_free(&c1);
+    acpcm_codes_free(&c2);
+    pcm_free(&in);
+    remove(path);
+}
+
 Err acpcm_selftest(int verbose)
 {
     failures = 0;
@@ -986,6 +1505,9 @@ Err acpcm_selftest(int verbose)
     test_drift(verbose);
     test_baskets(verbose);
     test_nfa4(verbose);
+    test_nfa5(verbose);
+    test_nfa6(verbose);
+    test_extract(verbose);
     test_rejects(verbose);
     printf("%s: %d failure(s)\n", failures ? "FAILED" : "passed", failures);
     return failures ? ERR_BAD_ARGS : ERR_OK;

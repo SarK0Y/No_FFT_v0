@@ -31,20 +31,23 @@ static void usage(const char* argv0)
         "  %s encode <in.wav> <out.no.fft> [frame_len] [degree] [f32|f16] [interp|least-sq]\n"
         "  %s decode <in.no.fft> <out.wav>\n"
         "  %s roundtrip <in.wav> [frame_len] [degree] [f32|f16] [interp|least-sq]\n"
-        "  %s convert <in.mp3> <out> [-algo poly|nfa1|nfa2|nfa3|nfa4]\n"
+        "  %s convert <in.mp3> <out> [-algo poly|nfa1|nfa2|nfa3|nfa4|nfa5|nfa6]\n"
         "               [frame_len] [degree] [f32|f16] [interp|least-sq]   (poly)\n"
         "               [-bits N] [-block N] [-policy ...] [-s N | -b N]   (nfa*)\n"
+        "               [-set-e X] [-set-err X | -set-rate X]             (nfa5)\n"
+        "               [-block N] [-set-e X] [-set-rate X]               (nfa6)\n"
         "  %s convert-all <in.mp3> <out-prefix>\n"
         "               [frame_len] [degree] [f32|f16] [interp|least-sq]\n"
         "               [-bits N] [-block N] [-policy ...] [-s N | -b N]\n"
+        "               [-set-e X] [-set-err X | -set-rate X]\n"
         "  %s play <in.no_fft>                 (WAV to stdout, for piping)\n"
         "\n"
         "acpcm, sample-domain DPCM with a range coder (no polynomial):\n"
-        "  %s ac-encode <in.wav> <out.nadc> [bits] [-snr] [-block N] [-policy never|always|drift] [-v3] [-v4 -s N | -b N]\n"
+        "  %s ac-encode <in.wav> <out.nadc> [bits] [-snr] [-block N] [-policy never|always|drift] [-v3] [-v4 -s N | -b N] [-v5 -set-e X -set-err X] [-v5 -set-rate X] [-v6 -block N -set-rate X]\n"
         "  %s ac-decode <in.nadc> <out.wav>\n"
         "  %s ac-play <in.nadc>               (WAV to stdout, for piping)\n"
         "  %s ac-info <in.nadc>\n"
-        "  %s ac-roundtrip <in.wav> [bits] [-block N] [-policy never|always|drift] [-v3] [-v4 -s N | -b N]\n"
+        "  %s ac-roundtrip <in.wav> [bits] [-block N] [-policy never|always|drift] [-v3] [-v4 -s N | -b N] [-v5 -set-e X -set-err X] [-v5 -set-rate X] [-v6 -block N -set-rate X]\n"
         "  %s ac-gen <out.wav> [seconds] [ch] [rate]\n"
         "  %s ac-play-alsa <in.nadc> [-d device]\n"
         "  %s selftest\n"
@@ -53,11 +56,21 @@ static void usage(const char* argv0)
         "                   needs -block; NFA2 with never still costs flags)\n"
         "    -v3            write NFA3 (adaptive basket table; no -block)\n"
         "    -v4            write NFA4 (basket-only; no -block, no -v3)\n"
+        "    -v5            write NFA5 (multiplicative log-grid; lossy; no\n"
+        "                   -block/-v3/-v4; takes -set-e and -set-err, or\n"
+        "                   -set-rate to auto-dial the err to a target rate)\n"
+        "    -v6            write NFA6 (NFA5 with a per-block re-fit of the\n"
+        "                   log step; lossy; needs -block; takes -set-e and\n"
+        "                   -set-rate, the target bits/sample, default 2.6)\n"
         "    -s N           NFA4 basket grid: N percent of the channel range\n"
         "                   (default 5; caps at 101 baskets; NFA4 ignores `bits`)\n"
         "    -b N           NFA4 basket count instead of a step percent, 1..256\n"
         "                   (needed above 101, e.g. -b 170; needs -v4)\n"
-        "    -algo name     convert codec: poly (default), nfa1, nfa2, nfa3, nfa4\n"
+        "    -set-e X       NFA5/NFA6 ratio base e (default 2, must be > 1)\n"
+        "    -set-err X     NFA5 log-domain step of the ratio (default 0.01)\n"
+        "    -set-rate X    target bits/sample: NFA5 auto-dials its err to hit\n"
+        "                   it, NFA6 meets it per block (default 2.6)\n"
+        "    -algo name     convert codec: poly (default), nfa1, nfa2, nfa3, nfa4, nfa5, nfa6\n"
         "    -bits N        acpcm quantiser width for convert/convert-all (default 6)\n",
         argv0, argv0, argv0, argv0, argv0, argv0,
         argv0, argv0, argv0, argv0, argv0, argv0, argv0, argv0);
@@ -75,6 +88,22 @@ static uint32_t parse_u32(const char* s, uint32_t dflt)
         return dflt;
 
     return (uint32_t)v;
+}
+
+/* Parses a finite double argument, e.g. NFA5's -set-e / -set-err.  Returns 0
+   on a missing, malformed or non-finite value. */
+static int parse_double_arg(const char* s, double* out)
+{
+    char* end = NULL;
+    double v;
+
+    if (s == NULL || *s == '\0')
+        return 0;
+    v = strtod(s, &end);
+    if (end == s || *end != '\0' || !(v == v))
+        return 0;
+    *out = v;
+    return 1;
 }
 
 /* Parses an NFA2 refit policy. Returns 0 on a bad value. */
@@ -198,9 +227,11 @@ static Err convert_emit(const char* algo, const char* in, const char* out,
                         uint32_t frame_len, uint32_t degree,
                         nofft_coeff_format cf, nofft_fit fit,
                         uint32_t step,
-                        bool have_baskets, uint32_t baskets)
+                        bool have_baskets, uint32_t baskets,
+                        double e5, double err5,
+                        bool v5a, double rate)
 {
-    Err e;
+    Err e = ERR_OK;
 
     if (strcmp(algo, "poly") == 0) {
         e = nofft_encode(out, pcm, frame_len, (uint16_t)degree, cf, fit);
@@ -210,6 +241,11 @@ static Err convert_emit(const char* algo, const char* in, const char* out,
         e = acpcm_encode2(out, pcm, (uint16_t)cbits, block_len, policy);
     } else if (strcmp(algo, "nfa3") == 0) {
         e = acpcm_encode3(out, pcm, (uint16_t)cbits);
+    } else if (strcmp(algo, "nfa6") == 0) {
+        e = acpcm_encode6(out, pcm, (uint16_t)cbits, block_len, e5, rate);
+    } else if (strcmp(algo, "nfa5") == 0) {
+        e = v5a ? acpcm_encode5_auto(out, pcm, (uint16_t)cbits, e5, rate)
+                : acpcm_encode5(out, pcm, (uint16_t)cbits, e5, err5);
     } else {
         e = have_baskets
                 ? acpcm_encode4_baskets(out, pcm, (uint16_t)cbits, baskets)
@@ -238,6 +274,13 @@ static Err convert_emit(const char* algo, const char* in, const char* out,
             snprintf(extra, sizeof(extra),
                      have_baskets ? "  baskets=%u" : "  step=%u",
                      have_baskets ? baskets : step);
+        else if (strcmp(algo, "nfa6") == 0)
+            snprintf(extra, sizeof(extra), "  block=%u e=%g rate=%g",
+                     block_len, e5, rate);
+        else if (strcmp(algo, "nfa5") == 0)
+            snprintf(extra, sizeof(extra),
+                     v5a ? "  e=%g rate=%g" : "  e=%g err=%g",
+                     e5, v5a ? rate : err5);
         else if (strcmp(algo, "nfa2") == 0)
             snprintf(extra, sizeof(extra), "  block=%u policy=%s",
                      block_len, policy_str(policy));
@@ -443,16 +486,50 @@ int main(int argc, char** argv)
         uint32_t step = 5;
         bool have_baskets = false;
         uint32_t baskets = 170;
+        bool have_e5 = false;
+        double e5 = ACPCM5_E_DEFAULT;
+        bool have_err5 = false;
+        double err5 = ACPCM5_ERR_DEFAULT;
+        bool have_rate = false;
+        double rate = ACPCM6_RATE_DEFAULT;
         const char* pos[4] = { NULL, NULL, NULL, NULL };
         int npos = 0;
 
         for (int i = 4; i < argc; i++) {
             if (strcmp(argv[i], "-algo") == 0) {
                 if (i + 1 >= argc) {
-                    fprintf(stderr, "-algo needs poly, nfa1, nfa2, nfa3 or nfa4\n");
+                    fprintf(stderr,
+                            "-algo needs poly, nfa1, nfa2, nfa3, nfa4, nfa5, nfa6 or\n");
                     return 2;
                 }
                 algo = argv[++i];
+                continue;
+            }
+            if (strcmp(argv[i], "-set-e") == 0) {
+                if (i + 1 >= argc || !parse_double_arg(argv[i + 1], &e5)) {
+                    fprintf(stderr, "-set-e needs a finite number > 1\n");
+                    return 2;
+                }
+                have_e5 = true;
+                i++;
+                continue;
+            }
+            if (strcmp(argv[i], "-set-err") == 0) {
+                if (i + 1 >= argc || !parse_double_arg(argv[i + 1], &err5)) {
+                    fprintf(stderr, "-set-err needs a finite positive number\n");
+                    return 2;
+                }
+                have_err5 = true;
+                i++;
+                continue;
+            }
+            if (strcmp(argv[i], "-set-rate") == 0) {
+                if (i + 1 >= argc || !parse_double_arg(argv[i + 1], &rate)) {
+                    fprintf(stderr, "-set-rate needs a finite positive number\n");
+                    return 2;
+                }
+                have_rate = true;
+                i++;
                 continue;
             }
             if (strcmp(argv[i], "-bits") == 0) {
@@ -532,9 +609,12 @@ int main(int argc, char** argv)
         int is_nfa2 = (strcmp(algo, "nfa2") == 0);
         int is_nfa3 = (strcmp(algo, "nfa3") == 0);
         int is_nfa4 = (strcmp(algo, "nfa4") == 0);
-        if (!is_poly && !is_nfa1 && !is_nfa2 && !is_nfa3 && !is_nfa4) {
+        int is_nfa5 = (strcmp(algo, "nfa5") == 0);
+        int is_nfa6 = (strcmp(algo, "nfa6") == 0);
+        if (!is_poly && !is_nfa1 && !is_nfa2 && !is_nfa3 && !is_nfa4 &&
+            !is_nfa5 && !is_nfa6) {
             fprintf(stderr,
-                    "unknown -algo: %s (use poly, nfa1, nfa2, nfa3 or nfa4)\n",
+                    "unknown -algo: %s (use poly, nfa1, nfa2, nfa3, nfa4, nfa5, nfa6 or)\n",
                     algo);
             return 2;
         }
@@ -552,9 +632,9 @@ int main(int argc, char** argv)
             if (!parse_fit(pos[3], &fit))
                 return 2;
             if (have_block || have_policy || have_step || have_baskets ||
-                have_bits) {
+                have_bits || have_e5 || have_err5 || have_rate) {
                 fprintf(stderr,
-                        "-bits/-block/-policy/-s/-b are only for the nfa* algos\n");
+                        "-bits/-block/-policy/-s/-b/-set-e/-set-err/-set-rate are only for the nfa* algos\n");
                 return 2;
             }
         } else {
@@ -567,24 +647,61 @@ int main(int argc, char** argv)
                         ACPCM_BITS_MIN, ACPCM_BITS_MAX);
                 return 2;
             }
-            if ((have_block || have_policy) && !is_nfa2) {
-                fprintf(stderr, "-block/-policy are only for -algo nfa2\n");
+            if (have_policy && !is_nfa2) {
+                fprintf(stderr, "-policy is only for -algo nfa2\n");
+                return 2;
+            }
+            if (have_block && !(is_nfa2 || is_nfa6 || false)) {
+                fprintf(stderr, "-block is only for -algo nfa2, nfa6 or\n");
                 return 2;
             }
             if ((have_step || have_baskets) && !is_nfa4) {
                 fprintf(stderr, "-s/-b are only for -algo nfa4\n");
                 return 2;
             }
+            if (have_e5 && !(is_nfa5 || is_nfa6 || false)) {
+                fprintf(stderr, "-set-e is only for -algo nfa5, nfa6 or\n");
+                return 2;
+            }
+            if (have_err5 && !is_nfa5) {
+                fprintf(stderr, "-set-err is only for -algo nfa5\n");
+                return 2;
+            }
+            if (have_rate && !(is_nfa5 || is_nfa6 || false)) {
+                fprintf(stderr, "-set-rate is only for -algo nfa5, nfa6 or\n");
+                return 2;
+            }
+            if ((is_nfa5 || is_nfa6 || false) &&
+                (!(e5 > 1.0) || !(e5 == e5))) {
+                fprintf(stderr, "-set-e must be a finite number > 1\n");
+                return 2;
+            }
+            if (is_nfa5 && (!(err5 >= ACPCM5_ERR_MIN) || !(err5 <= ACPCM5_ERR_MAX))) {
+                fprintf(stderr, "-set-err must be in %g..%g\n",
+                        ACPCM5_ERR_MIN, ACPCM5_ERR_MAX);
+                return 2;
+            }
+            if ((is_nfa5 || is_nfa6 || false) &&
+                (!(rate > 0.0) || !(rate == rate) || rate > 64.0)) {
+                fprintf(stderr, "-set-rate must be in 0..64\n");
+                return 2;
+            }
+            if (is_nfa5 && have_rate && have_err5) {
+                fprintf(stderr, "use either -set-err or -set-rate with -algo nfa5, not both\n");
+                return 2;
+            }
             if (have_step && have_baskets) {
                 fprintf(stderr, "use either -s or -b, not both\n");
                 return 2;
             }
-            if (have_policy && !have_block) {
+            if (have_policy && !have_block && is_nfa2) {
                 fprintf(stderr, "-policy needs -block\n");
                 return 2;
             }
             if (is_nfa2 && !have_block)
                 block_len = 1024;   /* sensible refit window by default */
+            if ((is_nfa6 || false) && !have_block)
+                block_len = 1024;   /* sensible per-block fit window by default */
         }
 
         tmp = temp_wav_path();
@@ -610,7 +727,8 @@ int main(int argc, char** argv)
 
         e = convert_emit(algo, argv[2], argv[3], &pcm, cbits, block_len,
                          policy, frame_len, degree, cf, fit,
-                         step, have_baskets, baskets);
+                         step, have_baskets, baskets, e5, err5,
+                         is_nfa5 && have_rate, rate);
         if (e != ERR_OK) {
             fprintf(stderr, "%s: %s\n", argv[3], g_err_str(e));
             pcm_free(&pcm);
@@ -627,7 +745,7 @@ int main(int argc, char** argv)
 
     if (strcmp(argv[1], "convert-all") == 0) {
         static const char* const algos[] = { "poly", "nfa1", "nfa2",
-                                             "nfa3", "nfa4" };
+                                             "nfa3", "nfa4", "nfa5", "nfa6" };
         const size_t n_algos = sizeof(algos) / sizeof(algos[0]);
         char* tmp;
         uint32_t cbits = 6;
@@ -637,6 +755,10 @@ int main(int argc, char** argv)
         uint32_t step = 5;
         bool have_baskets = false;
         uint32_t baskets = 170;
+        double e5 = ACPCM5_E_DEFAULT;
+        double err5 = ACPCM5_ERR_DEFAULT;
+        double rate = ACPCM6_RATE_DEFAULT;
+        bool have_rate = false;
         const char* pos[4] = { NULL, NULL, NULL, NULL };
         int npos = 0;
         int failures = 0;
@@ -650,6 +772,31 @@ int main(int argc, char** argv)
         /* Same flags as `convert`, but every algorithm runs, so there is no
            -algo.  The polynomial positional arguments still apply to `poly`. */
         for (int i = 4; i < argc; i++) {
+            if (strcmp(argv[i], "-set-e") == 0) {
+                if (i + 1 >= argc || !parse_double_arg(argv[i + 1], &e5)) {
+                    fprintf(stderr, "-set-e needs a finite number > 1\n");
+                    return 2;
+                }
+                i++;
+                continue;
+            }
+            if (strcmp(argv[i], "-set-err") == 0) {
+                if (i + 1 >= argc || !parse_double_arg(argv[i + 1], &err5)) {
+                    fprintf(stderr, "-set-err needs a finite positive number\n");
+                    return 2;
+                }
+                i++;
+                continue;
+            }
+            if (strcmp(argv[i], "-set-rate") == 0) {
+                if (i + 1 >= argc || !parse_double_arg(argv[i + 1], &rate)) {
+                    fprintf(stderr, "-set-rate needs a finite positive number\n");
+                    return 2;
+                }
+                have_rate = true;
+                i++;
+                continue;
+            }
             if (strcmp(argv[i], "-bits") == 0) {
                 if (i + 1 >= argc) {
                     fprintf(stderr, "-bits needs a width\n");
@@ -735,6 +882,19 @@ int main(int argc, char** argv)
                     ACPCM_BITS_MIN, ACPCM_BITS_MAX);
             return 2;
         }
+        if (!(e5 > 1.0) || !(e5 == e5)) {
+            fprintf(stderr, "-set-e must be a finite number > 1\n");
+            return 2;
+        }
+        if (!(err5 >= ACPCM5_ERR_MIN) || !(err5 <= ACPCM5_ERR_MAX)) {
+            fprintf(stderr, "-set-err must be in %g..%g\n",
+                    ACPCM5_ERR_MIN, ACPCM5_ERR_MAX);
+            return 2;
+        }
+        if (!(rate > 0.0) || !(rate == rate) || rate > 64.0) {
+            fprintf(stderr, "-set-rate must be in 0..64\n");
+            return 2;
+        }
         if (have_step && have_baskets) {
             fprintf(stderr, "use either -s or -b, not both\n");
             return 2;
@@ -778,7 +938,8 @@ int main(int argc, char** argv)
 
             e = convert_emit(algos[k], argv[2], out, &pcm, cbits, block_len,
                              policy, frame_len, degree, cf, fit,
-                             step, have_baskets, baskets);
+                             step, have_baskets, baskets, e5, err5,
+                             have_rate, rate);
             if (e != ERR_OK) {
                 fprintf(stderr, "%s: %s\n", out, g_err_str(e));
                 failures++;
@@ -811,10 +972,18 @@ int main(int argc, char** argv)
         bool have_policy = false;
         bool v3 = false;
         bool v4 = false;
+        bool v5 = false;
+        bool v6 = false;
         bool have_step = false;
         uint32_t step = 5;
         bool have_baskets = false;
         uint32_t baskets = 170;
+        bool have_e5 = false;
+        double e5 = ACPCM5_E_DEFAULT;
+        bool have_err5 = false;
+        double err5 = ACPCM5_ERR_DEFAULT;
+        bool have_rate6 = false;
+        double rate6 = ACPCM6_RATE_DEFAULT;
         bool show_snr = false;
         const char* in = NULL;
         const char* out = NULL;
@@ -830,6 +999,42 @@ int main(int argc, char** argv)
             }
             if (strcmp(argv[i], "-v4") == 0) {
                 v4 = true;
+                continue;
+            }
+            if (strcmp(argv[i], "-v5") == 0) {
+                v5 = true;
+                continue;
+            }
+            if (strcmp(argv[i], "-v6") == 0) {
+                v6 = true;
+                continue;
+            }
+            if (strcmp(argv[i], "-set-rate") == 0) {
+                if (i + 1 >= argc || !parse_double_arg(argv[i + 1], &rate6) ||
+                    !(rate6 > 0.0) || rate6 > 64.0) {
+                    fprintf(stderr, "-set-rate needs a finite number in (0, 64]\n");
+                    return 2;
+                }
+                have_rate6 = true;
+                i++;
+                continue;
+            }
+            if (strcmp(argv[i], "-set-e") == 0) {
+                if (i + 1 >= argc || !parse_double_arg(argv[i + 1], &e5)) {
+                    fprintf(stderr, "-set-e needs a finite number > 1\n");
+                    return 2;
+                }
+                have_e5 = true;
+                i++;
+                continue;
+            }
+            if (strcmp(argv[i], "-set-err") == 0) {
+                if (i + 1 >= argc || !parse_double_arg(argv[i + 1], &err5)) {
+                    fprintf(stderr, "-set-err needs a finite positive number\n");
+                    return 2;
+                }
+                have_err5 = true;
+                i++;
                 continue;
             }
             if (strcmp(argv[i], "-s") == 0) {
@@ -907,6 +1112,22 @@ int main(int argc, char** argv)
             fprintf(stderr, "-v4 cannot be combined with -block, -policy or -v3\n");
             return 2;
         }
+        if (v5 && (block_len != 0 || have_policy || v3 || v4 ||
+                   have_step || have_baskets)) {
+            fprintf(stderr,
+                    "-v5 cannot be combined with -block, -policy, -v3, -v4, -s or -b\n");
+            return 2;
+        }
+        if (v6 && (have_policy || v3 || v4 || have_step || have_baskets ||
+                   have_err5)) {
+            fprintf(stderr,
+                    "-v6 cannot be combined with -policy, -v3, -v4, -s, -b or -set-err\n");
+            return 2;
+        }
+        if (v6 && block_len == 0) {
+            fprintf(stderr, "-v6 needs -block N\n");
+            return 2;
+        }
         if (have_step && !v4) {
             fprintf(stderr, "-s needs -v4\n");
             return 2;
@@ -914,6 +1135,43 @@ int main(int argc, char** argv)
         if (have_baskets && !v4) {
             fprintf(stderr, "-b needs -v4\n");
             return 2;
+        }
+        if (have_e5 && !(v5 || v6)) {
+            fprintf(stderr, "-set-e needs -v5 or -v6\n");
+            return 2;
+        }
+        if (have_err5 && !v5) {
+            fprintf(stderr, "-set-err needs -v5\n");
+            return 2;
+        }
+        if (have_rate6 && !(v5 || v6)) {
+            fprintf(stderr, "-set-rate needs -v5 or -v6\n");
+            return 2;
+        }
+        if (v5 && have_rate6 && have_err5) {
+            fprintf(stderr, "use either -set-err or -set-rate with -v5, not both\n");
+            return 2;
+        }
+        if (v5) {
+            if (!(e5 > 1.0) || !(e5 == e5)) {
+                fprintf(stderr, "-set-e must be a finite number > 1\n");
+                return 2;
+            }
+            if (!(err5 >= ACPCM5_ERR_MIN) || !(err5 <= ACPCM5_ERR_MAX)) {
+                fprintf(stderr, "-set-err must be in %g..%g\n",
+                        ACPCM5_ERR_MIN, ACPCM5_ERR_MAX);
+                return 2;
+            }
+        }
+        if (v6) {
+            if (!(e5 > 1.0) || !(e5 == e5)) {
+                fprintf(stderr, "-set-e must be a finite number > 1\n");
+                return 2;
+            }
+            if (!(rate6 > 0.0) || rate6 > 64.0) {
+                fprintf(stderr, "-set-rate must be in (0, 64]\n");
+                return 2;
+            }
         }
         if (have_step && have_baskets) {
             fprintf(stderr, "use either -s or -b, not both\n");
@@ -930,7 +1188,13 @@ int main(int argc, char** argv)
             return 1;
         }
 
-        if (v4)
+        if (v6)
+            e = acpcm_encode6(out, &pcm, (uint16_t)bits, block_len, e5, rate6);
+        else if (v5)
+            e = have_rate6
+                    ? acpcm_encode5_auto(out, &pcm, (uint16_t)bits, e5, rate6)
+                    : acpcm_encode5(out, &pcm, (uint16_t)bits, e5, err5);
+        else if (v4)
             e = have_baskets
                     ? acpcm_encode4_baskets(out, &pcm, (uint16_t)bits, baskets)
                     : acpcm_encode4(out, &pcm, (uint16_t)bits, step);
@@ -955,6 +1219,13 @@ int main(int argc, char** argv)
                 snprintf(extra, sizeof(extra),
                          have_baskets ? "  baskets=%u" : "  step=%u",
                          have_baskets ? baskets : step);
+            else if (v6)
+                snprintf(extra, sizeof(extra), "  block=%u e=%g rate=%g",
+                         block_len, e5, rate6);
+            else if (v5)
+                snprintf(extra, sizeof(extra),
+                         have_rate6 ? "  e=%g rate=%g" : "  e=%g err=%g",
+                         e5, have_rate6 ? rate6 : err5);
             else if (v3)
                 snprintf(extra, sizeof(extra), "  baskets");
             else if (info.block_len != 0)
@@ -1079,10 +1350,16 @@ int main(int argc, char** argv)
             double bps = 8.0 * (double)info.payload /
                          ((double)info.frames * (double)info.channels);
             char extra[32];
-            const char* fname = (info.format == 3) ? "nfa4"
+            const char* fname = (info.format == 5) ? "nfa6"
+                              : (info.format == 4) ? "nfa5"
+                              : (info.format == 3) ? "nfa4"
                               : (info.format == 2) ? "nfa3"
                               : (info.format == 1) ? "nfa2" : "nfa1";
-            if (info.format == 3)
+            if (info.format == 5)
+                snprintf(extra, sizeof(extra), "  format=%s block=%u", fname, info.block_len);
+            else if (info.format == 4)
+                snprintf(extra, sizeof(extra), "  format=%s log-grid", fname);
+            else if (info.format == 3)
                 snprintf(extra, sizeof(extra), "  format=%s baskets", fname);
             else if (info.format == 2)
                 snprintf(extra, sizeof(extra), "  format=%s baskets", fname);
@@ -1110,10 +1387,18 @@ int main(int argc, char** argv)
         bool have_policy = false;
         bool v3 = false;
         bool v4 = false;
+        bool v5 = false;
+        bool v6 = false;
         bool have_step = false;
         uint32_t step = 5;
         bool have_baskets = false;
         uint32_t baskets = 170;
+        bool have_e5 = false;
+        double e5 = ACPCM5_E_DEFAULT;
+        bool have_err5 = false;
+        double err5 = ACPCM5_ERR_DEFAULT;
+        bool have_rate6 = false;
+        double rate6 = ACPCM6_RATE_DEFAULT;
         double peak = 0.0;
         const char* in = NULL;
 
@@ -1124,6 +1409,42 @@ int main(int argc, char** argv)
             }
             if (strcmp(argv[i], "-v4") == 0) {
                 v4 = true;
+                continue;
+            }
+            if (strcmp(argv[i], "-v5") == 0) {
+                v5 = true;
+                continue;
+            }
+            if (strcmp(argv[i], "-v6") == 0) {
+                v6 = true;
+                continue;
+            }
+            if (strcmp(argv[i], "-set-rate") == 0) {
+                if (i + 1 >= argc || !parse_double_arg(argv[i + 1], &rate6) ||
+                    !(rate6 > 0.0) || rate6 > 64.0) {
+                    fprintf(stderr, "-set-rate needs a finite number in (0, 64]\n");
+                    return 2;
+                }
+                have_rate6 = true;
+                i++;
+                continue;
+            }
+            if (strcmp(argv[i], "-set-e") == 0) {
+                if (i + 1 >= argc || !parse_double_arg(argv[i + 1], &e5)) {
+                    fprintf(stderr, "-set-e needs a finite number > 1\n");
+                    return 2;
+                }
+                have_e5 = true;
+                i++;
+                continue;
+            }
+            if (strcmp(argv[i], "-set-err") == 0) {
+                if (i + 1 >= argc || !parse_double_arg(argv[i + 1], &err5)) {
+                    fprintf(stderr, "-set-err needs a finite positive number\n");
+                    return 2;
+                }
+                have_err5 = true;
+                i++;
                 continue;
             }
             if (strcmp(argv[i], "-s") == 0) {
@@ -1200,6 +1521,22 @@ int main(int argc, char** argv)
             fprintf(stderr, "-v4 cannot be combined with -block, -policy or -v3\n");
             return 2;
         }
+        if (v5 && (block_len != 0 || have_policy || v3 || v4 ||
+                   have_step || have_baskets)) {
+            fprintf(stderr,
+                    "-v5 cannot be combined with -block, -policy, -v3, -v4, -s or -b\n");
+            return 2;
+        }
+        if (v6 && (have_policy || v3 || v4 || have_step || have_baskets ||
+                   have_err5)) {
+            fprintf(stderr,
+                    "-v6 cannot be combined with -policy, -v3, -v4, -s, -b or -set-err\n");
+            return 2;
+        }
+        if (v6 && block_len == 0) {
+            fprintf(stderr, "-v6 needs -block N\n");
+            return 2;
+        }
         if (have_step && !v4) {
             fprintf(stderr, "-s needs -v4\n");
             return 2;
@@ -1207,6 +1544,43 @@ int main(int argc, char** argv)
         if (have_baskets && !v4) {
             fprintf(stderr, "-b needs -v4\n");
             return 2;
+        }
+        if (have_e5 && !(v5 || v6)) {
+            fprintf(stderr, "-set-e needs -v5 or -v6\n");
+            return 2;
+        }
+        if (have_err5 && !v5) {
+            fprintf(stderr, "-set-err needs -v5\n");
+            return 2;
+        }
+        if (have_rate6 && !(v5 || v6)) {
+            fprintf(stderr, "-set-rate needs -v5 or -v6\n");
+            return 2;
+        }
+        if (v5 && have_rate6 && have_err5) {
+            fprintf(stderr, "use either -set-err or -set-rate with -v5, not both\n");
+            return 2;
+        }
+        if (v5) {
+            if (!(e5 > 1.0) || !(e5 == e5)) {
+                fprintf(stderr, "-set-e must be a finite number > 1\n");
+                return 2;
+            }
+            if (!(err5 >= ACPCM5_ERR_MIN) || !(err5 <= ACPCM5_ERR_MAX)) {
+                fprintf(stderr, "-set-err must be in %g..%g\n",
+                        ACPCM5_ERR_MIN, ACPCM5_ERR_MAX);
+                return 2;
+            }
+        }
+        if (v6) {
+            if (!(e5 > 1.0) || !(e5 == e5)) {
+                fprintf(stderr, "-set-e must be a finite number > 1\n");
+                return 2;
+            }
+            if (!(rate6 > 0.0) || rate6 > 64.0) {
+                fprintf(stderr, "-set-rate must be in (0, 64]\n");
+                return 2;
+            }
         }
         if (have_step && have_baskets) {
             fprintf(stderr, "use either -s or -b, not both\n");
@@ -1230,7 +1604,13 @@ int main(int argc, char** argv)
             return 1;
         }
 
-        if (v4)
+        if (v6)
+            e = acpcm_encode6(tmp, &pcm, (uint16_t)bits, block_len, e5, rate6);
+        else if (v5)
+            e = have_rate6
+                    ? acpcm_encode5_auto(tmp, &pcm, (uint16_t)bits, e5, rate6)
+                    : acpcm_encode5(tmp, &pcm, (uint16_t)bits, e5, err5);
+        else if (v4)
             e = have_baskets
                     ? acpcm_encode4_baskets(tmp, &pcm, (uint16_t)bits, baskets)
                     : acpcm_encode4(tmp, &pcm, (uint16_t)bits, step);
@@ -1284,6 +1664,13 @@ int main(int argc, char** argv)
                     snprintf(extra, sizeof(extra),
                              have_baskets ? "  baskets=%u" : "  step=%u",
                              have_baskets ? baskets : step);
+                else if (v6)
+                    snprintf(extra, sizeof(extra), "  block=%u e=%g rate=%g",
+                             block_len, e5, rate6);
+                else if (v5)
+                    snprintf(extra, sizeof(extra),
+                             have_rate6 ? "  e=%g rate=%g" : "  e=%g err=%g",
+                             e5, have_rate6 ? rate6 : err5);
                 else if (v3)
                     snprintf(extra, sizeof(extra), "  baskets");
                 else if (block_len != 0)
