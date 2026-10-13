@@ -139,5 +139,14 @@ global err to set. `-block` defaults to 1024 and `-set-rate` to 2.6.
   stereo file here, and a smaller block barely changes it - the table rebuild is
   not the bottleneck). Decoding is unchanged.
 - A per-block refit *without* the equal budgets - a budget pool that carries
-  unspent bits across blocks - is the natural next experiment. It would push
-  NFA6 toward the auto-dial's allocation while keeping the per-block cap.
+  unspent bits across blocks - was tried and rejected. On real material it is
+  a no-op: every non-flat block's rate fit spends its whole allowance, so no
+  block actually leaves slack to pool (the measured output was identical to the
+  equal-slice figure on the quiet, loud, mixed-tone and sweep signals, and a
+  hair different only on the two with flat runs). Where slack *is* real - true
+  digital silence - the pool banks it and hands it to the next loud block at a
+  very fine step, but there the entropy estimate understates the true symbol
+  cost badly: 1 s of silence then 1 s of noise reached 68.9 dB, but at
+  **6.35 b/sample against the 2.6 target**. Pooling therefore cannot beat the
+  global `err`, and it breaks the one property NFA6 has over NFA5 - a bounded
+  per-block rate - so the equal slice is kept.

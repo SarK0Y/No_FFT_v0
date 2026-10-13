@@ -597,9 +597,10 @@ Err plan_channel(const float* s, size_t n, uint16_t bits, ChanPlan* pl)
  * A basket is the block's worth of residuals about to be coded.  When a1 is
  * wrong for the material in it, |q| climbs into the range that costs real
  * bits per sample (a unary run plus mantissa) even though it is nowhere near
- * the symbol limit, so the meter counts |q| >= lim / g_acp2_den and
- * fires the refit once that fraction of the block looks expensive.
- * Tunables and the refit counter live at the top of this file. */
+ * the symbol limit, so the meter counts |q| >= lim / ACP2_BASKET_DEN and
+ * fires the refit once that fraction of the block looks expensive. */
+const int ACP2_BASKET_DEN_UNUSED = 8;
+const int ACP2_DRIFT_PCT_UNUSED  = 1;
 
 /* Least squares a1 over the source pairs (j-1, j), j in [j0, j1).  Quantised
    exactly like plan_channel, so encoder and decoder keep the same value; a
@@ -966,15 +967,17 @@ static double k_entropy_bits(const double* r, size_t cnt, double err,
 /* NFA6, the blocked NFA5: the log-domain quantum err is re-fitted at every
  * block boundary.  Block b covers frames [b*block_len, (b+1)*block_len) on the
  * shifted grid (frame 0 is the seed, so block 0 codes block_len-1 symbols).
- * The encoder's fit is a per-block rate control: err is bisected down until
- * the block's estimated K cost (k_entropy_bits) plus the 8 bit err code fits a
- * per-block slice `rate` of the target bits/sample.  The decoder never sees
- * the policy, only the byte, so any encoder-side fit would work; quiet blocks
- * keep a fine step almost free because their K are mostly 0, loud or fast
- * blocks coarsen to stay in budget, and the target rate is met block by block
- * instead of only on average.  A block with no ratios or a flat span gets the
- * coarsest err, which is free: all its K are exactly 0.  The 8 bit code, the
- * rebuilt table and everything else travel exactly as NFA5.
+ * The encoder's fit is a per-block rate control: err is bisected down until the
+ * block's estimated K cost (k_entropy_bits) plus the 8 bit err code fits a
+ * per-block slice `rate` of the target bits/sample.  The decoder never sees the
+ * policy, only the byte, so any encoder-side fit would work; quiet blocks keep
+ * a fine step almost free because their K are mostly 0, loud or fast blocks
+ * coarsen to stay in budget, and each block's rate is bounded rather than only
+ * the average.  A block with no ratios or a flat span gets the coarsest err,
+ * which is free: all its K are exactly 0.  The 8 bit code, the rebuilt table
+ * and everything else travel exactly as NFA5.  (A pooled variant that let
+ * blocks spend each other's unspent budget was tried and rejected; see the note
+ * at the rate control below.)
  */
 Err encode_chunk6(const float* s, size_t n, double ebase, uint32_t block_len,
                   double rate, std::vector<uint8_t>* out)
@@ -1026,8 +1029,15 @@ Err encode_chunk6(const float* s, size_t n, double ebase, uint32_t block_len,
                 err = ACPCM5_ERR_MAX;
             } else {
                 /* rate control: the finest err whose estimated K cost fits this
-                   block's slice of the target rate.  The 8 bit err byte is the
-                   only overhead; the per-chunk seed is amortised away here. */
+                   block's own slice of the target rate.  The 8 bit err byte is
+                   the only overhead; the per-chunk seed is amortised away.  A
+                   pooled variant that let blocks spend each other's unspent
+                   budget was tried and rejected: on real material the fit
+                   saturates every non-flat block, so no block leaves slack, and
+                   where slack is real (true silence) the finer step the pool
+                   buys costs far more than the entropy estimate, blowing the
+                   target (6.3 b/s against 2.6).  Equal slices keep the per-block
+                   rate an actual bound. */
                 double budget = rate * (double)cnt + 8.0;
                 double lo = ACPCM5_ERR_MIN, hi = ACPCM5_ERR_MAX;
                 double loge = std::log(ebase);
@@ -1253,7 +1263,7 @@ static Err acpcm_encode_impl(const char* path, const pcm_buf* p, uint16_t bits,
                      : (v5 || v5a) ? ACPCM_MAGIC5
                      : (v3 ? ACPCM_MAGIC3 : (v2 ? ACPCM_MAGIC2 : ACPCM_MAGIC));
     size_t base = (v2 || v6) ? (size_t)ACPCM_FIXED_HEADER2
-                             : (size_t)ACPCM_FIXED_HEADER;
+                                   : (size_t)ACPCM_FIXED_HEADER;
     size_t hsz = base + 4 * ch;
     std::vector<uint8_t> hdr(hsz, 0);
     memcpy(hdr.data(), magic, 4);
@@ -1263,7 +1273,7 @@ static Err acpcm_encode_impl(const char* path, const pcm_buf* p, uint16_t bits,
     put_u32(hdr.data() + 16, p->sample_rate);
     if (v2 || v6)
         put_u32(hdr.data() + ACPCM_FIXED_HEADER,
-                (uint32_t)(v6 ? block6 : block_len));
+                (uint32_t)((v6) ? block6 : block_len));
     for (size_t c = 0; c < ch; c++)
         put_u32(hdr.data() + base + 4 * c, (uint32_t)chunks[c].size());
 
@@ -1343,9 +1353,10 @@ Err acpcm_encode6(const char* path, const pcm_buf* p, uint16_t bits,
     if (!(rate > 0.0) || !(rate == rate) || rate > 64.0)
         return ERR_RANGE;
     return acpcm_encode_impl(path, p, bits, 0, ACP2_NEVER, false, 0, 0,
-                             false, 0.0, 0.0, true, block_len, e, rate,
-                             false, 0.0);
+                             false, 0.0, 0.0, true, block_len, e, rate, false, 0.0);
 }
+
+
 
 Err acpcm_encode5_auto(const char* path, const pcm_buf* p, uint16_t bits,
                        double e, double rate)

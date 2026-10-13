@@ -1363,6 +1363,8 @@ static void test_nfa6(int verbose)
     pcm_free(&o6);
 }
 
+
+
 static void test_extract(int verbose)
 {
     char path[512];
@@ -1466,22 +1468,25 @@ static void test_extract(int verbose)
         acpcm_codes_free(&cx);
     }
     if (acpcm_encode4_baskets(path, &in, 8, 32) == ERR_OK) {
-        acpcm_codes cx;
-        rej4 = (acpcm_extract_codes(path, &cx) == ERR_UNSUPPORTED_FMT);
-        acpcm_codes_free(&cx);
+        acpcm_codes cx4;
+        rej4 = (acpcm_extract_codes(path, &cx4) == ERR_UNSUPPORTED_FMT);
+        acpcm_codes_free(&cx4);
     }
     if (acpcm_encode5(path, &in, 8, 2.0, 0.01) == ERR_OK) {
-        acpcm_codes cx;
-        rej5 = (acpcm_extract_codes(path, &cx) == ERR_UNSUPPORTED_FMT);
-        acpcm_codes_free(&cx);
+        acpcm_codes cx1;
+        rej5 = (acpcm_extract_codes(path, &cx1) == ERR_UNSUPPORTED_FMT);
+        acpcm_codes_free(&cx1);
     }
     if (acpcm_encode6(path, &in, 8, 256, 2.0, 2.6) == ERR_OK) {
-        acpcm_codes cx;
-        rej6 = (acpcm_extract_codes(path, &cx) == ERR_UNSUPPORTED_FMT);
-        acpcm_codes_free(&cx);
+        acpcm_codes cx2;
+        rej6 = (acpcm_extract_codes(path, &cx2) == ERR_UNSUPPORTED_FMT);
+        acpcm_codes_free(&cx2);
+    }
+    if (0) {
+        
     }
     check(rej3 && rej4 && rej5 && rej6, verbose,
-          "extract rejects nfa3, nfa4, nfa5 and nfa6", "");
+          "extract rejects nfa3, nfa4, nfa5, nfa6", "");
 
     acpcm_codes_free(&c1);
     acpcm_codes_free(&c2);

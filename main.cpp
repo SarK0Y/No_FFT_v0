@@ -231,7 +231,7 @@ static Err convert_emit(const char* algo, const char* in, const char* out,
                         double e5, double err5,
                         bool v5a, double rate)
 {
-    Err e;
+    Err e = ERR_OK;
 
     if (strcmp(algo, "poly") == 0) {
         e = nofft_encode(out, pcm, frame_len, (uint16_t)degree, cf, fit);
@@ -499,7 +499,7 @@ int main(int argc, char** argv)
             if (strcmp(argv[i], "-algo") == 0) {
                 if (i + 1 >= argc) {
                     fprintf(stderr,
-                            "-algo needs poly, nfa1, nfa2, nfa3, nfa4, nfa5 or nfa6\n");
+                            "-algo needs poly, nfa1, nfa2, nfa3, nfa4, nfa5, nfa6 or\n");
                     return 2;
                 }
                 algo = argv[++i];
@@ -614,7 +614,7 @@ int main(int argc, char** argv)
         if (!is_poly && !is_nfa1 && !is_nfa2 && !is_nfa3 && !is_nfa4 &&
             !is_nfa5 && !is_nfa6) {
             fprintf(stderr,
-                    "unknown -algo: %s (use poly, nfa1, nfa2, nfa3, nfa4, nfa5 or nfa6)\n",
+                    "unknown -algo: %s (use poly, nfa1, nfa2, nfa3, nfa4, nfa5, nfa6 or)\n",
                     algo);
             return 2;
         }
@@ -651,27 +651,28 @@ int main(int argc, char** argv)
                 fprintf(stderr, "-policy is only for -algo nfa2\n");
                 return 2;
             }
-            if (have_block && !(is_nfa2 || is_nfa6)) {
-                fprintf(stderr, "-block is only for -algo nfa2 or nfa6\n");
+            if (have_block && !(is_nfa2 || is_nfa6 || false)) {
+                fprintf(stderr, "-block is only for -algo nfa2, nfa6 or\n");
                 return 2;
             }
             if ((have_step || have_baskets) && !is_nfa4) {
                 fprintf(stderr, "-s/-b are only for -algo nfa4\n");
                 return 2;
             }
-            if (have_e5 && !(is_nfa5 || is_nfa6)) {
-                fprintf(stderr, "-set-e is only for -algo nfa5 or nfa6\n");
+            if (have_e5 && !(is_nfa5 || is_nfa6 || false)) {
+                fprintf(stderr, "-set-e is only for -algo nfa5, nfa6 or\n");
                 return 2;
             }
             if (have_err5 && !is_nfa5) {
                 fprintf(stderr, "-set-err is only for -algo nfa5\n");
                 return 2;
             }
-            if (have_rate && !(is_nfa5 || is_nfa6)) {
-                fprintf(stderr, "-set-rate is only for -algo nfa5 or nfa6\n");
+            if (have_rate && !(is_nfa5 || is_nfa6 || false)) {
+                fprintf(stderr, "-set-rate is only for -algo nfa5, nfa6 or\n");
                 return 2;
             }
-            if ((is_nfa5 || is_nfa6) && (!(e5 > 1.0) || !(e5 == e5))) {
+            if ((is_nfa5 || is_nfa6 || false) &&
+                (!(e5 > 1.0) || !(e5 == e5))) {
                 fprintf(stderr, "-set-e must be a finite number > 1\n");
                 return 2;
             }
@@ -680,7 +681,7 @@ int main(int argc, char** argv)
                         ACPCM5_ERR_MIN, ACPCM5_ERR_MAX);
                 return 2;
             }
-            if ((is_nfa5 || is_nfa6) &&
+            if ((is_nfa5 || is_nfa6 || false) &&
                 (!(rate > 0.0) || !(rate == rate) || rate > 64.0)) {
                 fprintf(stderr, "-set-rate must be in 0..64\n");
                 return 2;
@@ -699,8 +700,8 @@ int main(int argc, char** argv)
             }
             if (is_nfa2 && !have_block)
                 block_len = 1024;   /* sensible refit window by default */
-            if (is_nfa6 && !have_block)
-                block_len = 1024;   /* sensible NFA6 block by default */
+            if ((is_nfa6 || false) && !have_block)
+                block_len = 1024;   /* sensible per-block fit window by default */
         }
 
         tmp = temp_wav_path();
@@ -1355,8 +1356,7 @@ int main(int argc, char** argv)
                               : (info.format == 2) ? "nfa3"
                               : (info.format == 1) ? "nfa2" : "nfa1";
             if (info.format == 5)
-                snprintf(extra, sizeof(extra), "  format=%s block=%u log-grid",
-                         fname, info.block_len);
+                snprintf(extra, sizeof(extra), "  format=%s block=%u", fname, info.block_len);
             else if (info.format == 4)
                 snprintf(extra, sizeof(extra), "  format=%s log-grid", fname);
             else if (info.format == 3)

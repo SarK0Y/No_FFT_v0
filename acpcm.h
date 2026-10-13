@@ -147,7 +147,7 @@ typedef struct {
     uint16_t bits;       /* quantiser width actually used */
     uint32_t channels;
     uint32_t sample_rate;
-    uint32_t block_len;  /* NFA2/NFA6 block length in frames, 0 for NFA1/NFA3/NFA4/NFA5 */
+    uint32_t block_len;  /* NFA2/NFA6 block length in frames, 0 otherwise */
     uint8_t  format;     /* 0: NFA1, 1: NFA2, 2: NFA3, 3: NFA4, 4: NFA5, 5: NFA6 */
     uint64_t frames;     /* frames per channel */
     uint64_t payload;    /* bytes of range coded payload */
@@ -235,13 +235,39 @@ Err acpcm_encode5_auto(const char* path, const pcm_buf* p, uint16_t bits,
 
 Err acpcm_decode(const char* path, pcm_buf* out);
 
+/* ---- in-memory buffer API ----
+ *
+ * The same containers the path based calls read and write, but handed back in a
+ * malloc'd block and decoded straight from memory.  A host application, or a
+ * codec module, uses these; the path calls above are thin file wrappers over
+ * them and produce byte identical output.  Release an encoded buffer with
+ * acpcm_buf_free.  The encode variants mirror acpcm_encode / 2 / 3 / 4 /
+ * 4_baskets / 5 / 6 / 5_auto and apply the same argument validation. */
+Err acpcm_encode_buf(uint8_t** out, size_t* out_len, const pcm_buf* p, uint16_t bits);
+Err acpcm_encode2_buf(uint8_t** out, size_t* out_len, const pcm_buf* p, uint16_t bits,
+                      uint32_t block_len, acpcm_p2_policy policy);
+Err acpcm_encode3_buf(uint8_t** out, size_t* out_len, const pcm_buf* p, uint16_t bits);
+Err acpcm_encode4_buf(uint8_t** out, size_t* out_len, const pcm_buf* p, uint16_t bits,
+                      uint32_t step);
+Err acpcm_encode4_baskets_buf(uint8_t** out, size_t* out_len, const pcm_buf* p,
+                              uint16_t bits, uint32_t baskets);
+Err acpcm_encode5_buf(uint8_t** out, size_t* out_len, const pcm_buf* p, uint16_t bits,
+                      double e, double err);
+Err acpcm_encode6_buf(uint8_t** out, size_t* out_len, const pcm_buf* p, uint16_t bits,
+                      uint32_t block_len, double e, double rate);
+Err acpcm_encode5_auto_buf(uint8_t** out, size_t* out_len, const pcm_buf* p,
+                           uint16_t bits, double e, double rate);
+Err acpcm_decode_buf(const uint8_t* data, size_t len, pcm_buf* out);
+Err acpcm_file_info_buf(const uint8_t* data, size_t len, acpcm_info* out);
+void acpcm_buf_free(void* p);
+
 /* Header only, no decoding. */
 Err acpcm_file_info(const char* path, acpcm_info* out);
 
 /* Decodes the residual symbols of an NFA1 (or NFA2) stream into `out` without
    rebuilding the samples; the refit flags NFA2 codes are consumed so the two
-   sides stay in step.  NFA3/NFA4/NFA5/NFA6 carry no single residual symbol and
-   are rejected with ERR_UNSUPPORTED_FMT.  Release the result with
+   sides stay in step.  NFA3/NFA4/NFA5/NFA6 carry no single residual symbol
+   and are rejected with ERR_UNSUPPORTED_FMT.  Release the result with
    acpcm_codes_free. */
 Err acpcm_extract_codes(const char* path, acpcm_codes* out);
 void acpcm_codes_free(acpcm_codes* c);
