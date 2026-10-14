@@ -35,8 +35,8 @@ WIN_CXX      ?= x86_64-w64-mingw32-g++
 WIN_CXXFLAGS ?= -std=c++17 -O2 -Wall -Wextra -Werror -pedantic
 WIN_LDLIBS   ?= -lm
 
-SRC := main.cpp nofft.cpp acpcm.cpp selftest.cpp
-HDR := nofft.h acpcm.h selftest.h third_party/dr_wav.h
+SRC := main.cpp nofft.cpp acpcm.cpp selftest.cpp nfm.cpp
+HDR := nofft.h acpcm.h selftest.h nfm.h third_party/dr_wav.h
 
 # The same codec in portable C11.  It is a separate binary, not a rewrite of the
 # C++ one: the C++ build stays as the format reference and `make check-ac`
@@ -94,8 +94,8 @@ OBJ_DIR := build/obj
 MOD_DIR := build/modules
 BIN_DIR := build/bin
 
-CODEC_LIB_SRC := nofft.cpp acpcm.cpp codec.cpp codec_builtin.cpp
-CODEC_HDR     := nofft.h acpcm.h codec.h
+CODEC_LIB_SRC := nofft.cpp acpcm.cpp codec.cpp codec_builtin.cpp nfm.cpp
+CODEC_HDR     := nofft.h acpcm.h codec.h nfm.h
 CODEC_OBJS    := $(OBJ_DIR)/nofft.o $(OBJ_DIR)/acpcm.o \
                  $(OBJ_DIR)/codec.o $(OBJ_DIR)/codec_builtin.o
 CODEC_NAMES   := poly nfa1 nfa2 nfa3 nfa4 nfa5 nfa6
