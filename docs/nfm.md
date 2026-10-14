@@ -1,32 +1,26 @@
 # NFM container (No_FFT Media)
 
-The **NFM** format is a simple, little-endian, stream-friendly container that can
-bundle one of the No_FFT algorithms together with arbitrary textual metadata and
-an optional PNG/JPEG image (a cover). Its purpose is to keep a compressed audio
-stream and its provenance in a single, self-describing file.
+The **NFM** format is a simple, little-endian, length-prefixed container that can
+bundle any No_FFT codec payload with optional text metadata and an optional
+PNG/JPEG image (cover). Files use extension `.nfm` and start with magic `nfm`
+(3 bytes).
 
-Files use extension `.nfm` and start with magic `"NFM\0"` (or just `"NFM"` with
-a version byte). The layout is designed so a decoder can scan fields until
-`END_HEAD`, then read the raw compressed payload produced by the selected codec.
-
-## Magic and header
-
-All integers are little endian.
+## Header structure
 
 ```text
 +---------------------+
-| magic[4] = "NFM"   |
-| version  (uint8_t) |  (currently 1)
-| reserved (uint8_t) |
-| flags    (uint16_t)|
+| magic[3] = "nfm"   |
+| header_len (uint64_t)|
 +---------------------+
 ```
 
-`flags` is reserved for future use and must be 0 in v1.
+`header_len` is the length in bytes of the header data that follows (text
+fields + optional image). The header data contains zero or more text fields,
+optionally followed by an image block.
 
 ## Text fields
 
-Any number of UTF-8 text fields may follow. Each field is encoded as:
+Text fields are encoded inside the header data as:
 
 ```text
 +--------------------+
@@ -49,8 +43,8 @@ Common keys suggested (not enforced):
 
 ## Optional image
 
-An optional cover image may be embedded. If present it appears once before
-`END_HEAD`. The image block:
+An optional cover image may be embedded inside the header data. If present, the
+image block is encoded as:
 
 ```text
 +-------------------+
@@ -61,46 +55,89 @@ An optional cover image may be embedded. If present it appears once before
 ```
 
 `img_type` values:
-- `0` = no image (not used when block is present)
 - `1` = PNG
 - `2` = JPEG
 
 The data is the raw bytes of the image file (not base64).
 
-## END_HEAD marker
+## Payload
 
-The header ends with a fixed marker:
-
-```text
-+------------------------+
-| end_head[8] = "END_HEAD"|
-+------------------------+
-```
-
-Everything after `END_HEAD` is the **inner payload**: the exact byte stream
-produced by the chosen codec, written as-is. For `poly` this means the `.no_fft`
-container bytes; for `nfa1..nfa6` this means the `.nadc` container bytes (which
-start with `NFA1`..`NFA6`). A decoder can detect the inner format by reading the
-first 4 bytes of the payload.
+Everything after the header (header data as specified by `header_len`) is the
+**inner payload**: the exact byte stream produced by the chosen codec, written
+as-is. For `poly` this means the `.no_fft` container bytes; for `nfa1..nfa6`
+this means the `.nadc` container bytes (which start with `NFA1`..`NFA6`). A
+decoder can detect the inner format by reading the first 4 bytes of the payload.
 
 ## Recommended behavior
 
-- Writing: emit NFM header, write any desired text/image fields, write
-  `END_HEAD`, append the codec's encoded bytes.
-- Reading: read up to `END_HEAD` (or scan until it appears), extract metadata and
-  optional image, then treat the remainder as the inner codec stream and decode
-  with the appropriate codec (based on inner magic or on the `codec` text field).
+- Writing: emit magic `nfm`, write `header_len` (u64), write header data (text
+  fields and optional image), append the codec's encoded bytes.
+- Reading: read magic + header_len, read `header_len` bytes of header data to
+  extract metadata and optional image, treat the remainder as the inner codec
+  stream and decode with the appropriate codec.
 - Preservation: when copying/re-encoding, copy unknown fields and image.
-- Streaming: the format is seek-forward-friendly in the header (all lengths are
-  explicit) and the payload is a single blob.
+- Streaming: the format is seek-forward-friendly via length prefixes.
+
+## Creating NFM files
+
+The CLI can create NFM files during conversion. When `-nfm` is specified,
+`convert`/`convert-all` wrap the encoded output in an NFM container and set the
+output extension to `.nfm`.
+
+### Example (convert an MP3/WAV to NFM)
+
+```bash
+./nofft convert input.mp3 output.nfm -algo nfa3 -bits 6 -nfm
+```
+
+Metadata is automatically extracted from the source file when available. Override
+or add fields explicitly:
+
+```bash
+./nofft convert input.mp3 output.nfm -algo nfa3 -bits 6 -nfm \
+  -nfm-title "Song Title" \
+  -nfm-artist "Artist Name" \
+  -nfm-album "Album Name"
+```
+
+Flags:
+- `-nfm` — enable NFM output (forces `.nfm` extension)
+- `-nfm-title <text>` — set title (overrides extracted value)
+- `-nfm-artist <text>` — set artist (overrides extracted value)
+- `-nfm-album <text>` — set album (overrides extracted value)
+
+With `convert-all`, each codec produces `basename.<codec>.nfm` when `-nfm` is
+set.
+
+### Playing and decoding NFM
+
+NFM files are auto-detected. The CLI unwraps them transparently for playback and
+decoding:
+
+```bash
+./nofft play song.nfm           # play directly (nofft or ACPCM inside)
+./nofft decode song.nfm out.wav # decode poly/NOFF payload to WAV
+./nofft ac-play song.nfm        # play ACPCM (.nadc) payload to stdout/WAV stream
+./nofft ac-decode song.nfm out.wav # decode ACPCM payload to WAV
+```
+
+### Library API
+
+The C API can also write NFM containers directly:
+
+```c
+#include "nfm.h"
+
+nfm_meta meta = { .title = "Title", .artist = "Artist", .album = "Album" };
+Err e = nfm_write("out.nfm", payload, payload_len, &meta, img, img_len, NFM_IMG_PNG);
+```
 
 ## Minimal example (conceptual)
 
 ```text
-NFM\0  v1  flags=0
+nfm  header_len=...
 name_len=5 "title" value_len=12 "Test Track"
 img_type=1 img_len=... <png bytes>
-END_HEAD
 <NFA3 or NOFF container bytes>
 ```
 
