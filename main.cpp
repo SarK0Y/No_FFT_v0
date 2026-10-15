@@ -8,6 +8,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <fcntl.h>
 #include <errno.h>
 #include <sys/wait.h>
 #include <sys/stat.h>
@@ -219,13 +220,11 @@ static int extract_media_meta(const char* path, char** title, char** artist, cha
     if (artist != NULL) *artist = NULL;
     if (album != NULL) *album = NULL;
 
-    /* Write ffmpeg stderr to a temp file, then parse.  This avoids any pipe
-       buffering issues and is more robust. */
+    /* Capture ffmpeg's stderr (which carries the metadata) into a temp file. */
     char tmp_template[] = "/tmp/nofft_meta_XXXXXX";
     int tmp_fd = mkstemp(tmp_template);
     if (tmp_fd < 0)
         return -1;
-    close(tmp_fd);
 
     const char* argv[10];
     pid_t pid;
@@ -237,20 +236,25 @@ static int extract_media_meta(const char* path, char** title, char** artist, cha
     argv[4] = path;
     argv[5] = "-f";
     argv[6] = "null";
-    argv[7] = tmp_template;
+    argv[7] = "-";
     argv[8] = NULL;
     argv[9] = NULL;
 
     pid = fork();
     if (pid < 0) {
+        close(tmp_fd);
         remove(tmp_template);
         return -1;
     }
 
     if (pid == 0) {
+        dup2(tmp_fd, 2);   /* stderr -> temp file */
+        close(tmp_fd);
         execvp(argv[0], (char* const*)argv);
         _exit(127);
     }
+
+    close(tmp_fd);
 
     int status = 0;
     waitpid(pid, &status, 0);
@@ -293,6 +297,94 @@ static int extract_media_meta(const char* path, char** title, char** artist, cha
 
     fclose(fp);
     remove(tmp_template);
+    return 0;
+}
+
+/* Extract embedded cover art from a media file via ffmpeg.  On success, returns
+   0 and sets img, img_len (caller frees with free()) and img_type to NFM_IMG_PNG.
+   Returns -1 if no image is found or on error. */
+static int extract_media_img(const char* path, uint8_t** img, size_t* img_len,
+                             int* img_type)
+{
+    *img = NULL;
+    *img_len = 0;
+    *img_type = NFM_IMG_NONE;
+
+    char tmp_template[] = "/tmp/nofft_img_XXXXXX.png";
+    int tmp_fd = mkstemps(tmp_template, 4);
+    if (tmp_fd < 0)
+        return -1;
+    close(tmp_fd);
+
+    const char* argv[10];
+    pid_t pid;
+
+    argv[0] = "ffmpeg";
+    argv[1] = "-nostdin";
+    argv[2] = "-hide_banner";
+    argv[3] = "-loglevel";
+    argv[4] = "error";
+    argv[5] = "-y";
+    argv[6] = "-i";
+    argv[7] = path;
+    argv[8] = tmp_template;
+    argv[9] = NULL;
+
+    pid = fork();
+    if (pid < 0) {
+        remove(tmp_template);
+        return -1;
+    }
+
+    if (pid == 0) {
+        /* Audio-only sources make ffmpeg print a harmless "no stream" error;
+           silence it since there is nothing for us to read. */
+        int devnull = open("/dev/null", O_WRONLY);
+        if (devnull >= 0) {
+            dup2(devnull, 2);
+            close(devnull);
+        }
+        execvp(argv[0], (char* const*)argv);
+        _exit(127);
+    }
+
+    int status = 0;
+    waitpid(pid, &status, 0);
+
+    if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) {
+        remove(tmp_template);
+        return -1;
+    }
+
+    FILE* f = fopen(tmp_template, "rb");
+    if (f == NULL) {
+        remove(tmp_template);
+        return -1;
+    }
+    fseek(f, 0, SEEK_END);
+    long sz = ftell(f);
+    fseek(f, 0, SEEK_SET);
+    if (sz <= 0) {
+        fclose(f);
+        remove(tmp_template);
+        return -1;
+    }
+    uint8_t* buf = (uint8_t*)malloc((size_t)sz);
+    if (buf == NULL) {
+        fclose(f);
+        remove(tmp_template);
+        return -1;
+    }
+    size_t got = fread(buf, 1, (size_t)sz, f);
+    fclose(f);
+    remove(tmp_template);
+    if (got != (size_t)sz) {
+        free(buf);
+        return -1;
+    }
+    *img = buf;
+    *img_len = (size_t)sz;
+    *img_type = NFM_IMG_PNG;
     return 0;
 }
 
@@ -397,11 +489,13 @@ static Err convert_emit(const char* algo, const char* in, const char* out,
                         bool have_baskets, uint32_t baskets,
                         double e5, double err5,
                         bool v5a, double rate,
-                        bool use_nfm, const nfm_meta* meta)
+                        bool use_nfm, const nfm_meta* meta,
+                        const uint8_t* img, size_t img_len, int img_type)
 {
     Err e = ERR_OK;
     uint8_t* buf = NULL;
     size_t buf_len = 0;
+    size_t enc_len = 0;
 
     if (use_nfm) {
         /* Encode to a buffer, then wrap in NFM. */
@@ -430,7 +524,8 @@ static Err convert_emit(const char* algo, const char* in, const char* out,
         m.title = (meta != NULL) ? meta->title : NULL;
         m.artist = (meta != NULL) ? meta->artist : NULL;
         m.album = (meta != NULL) ? meta->album : NULL;
-        e = nfm_write(out, buf, buf_len, &m, NULL, 0, NFM_IMG_NONE);
+        enc_len = buf_len;
+        e = nfm_write(out, buf, buf_len, &m, img, img_len, img_type);
         nofft_buf_free(buf);
         if (e != ERR_OK)
             return e;
@@ -469,7 +564,14 @@ static Err convert_emit(const char* algo, const char* in, const char* out,
         char extra[64];
 
         memset(&info, 0, sizeof(info));
-        if (acpcm_file_info(out, &info) == ERR_OK && info.frames != 0)
+        if (use_nfm) {
+            info.payload = enc_len;
+            info.frames = (uint32_t)(pcm->count / (pcm->channels ? pcm->channels : 1));
+            info.channels = pcm->channels;
+        } else if (acpcm_file_info(out, &info) == ERR_OK) {
+            /* info filled in by the parser */
+        }
+        if (info.frames != 0)
             bps = 8.0 * (double)info.payload /
                   ((double)info.frames * (double)info.channels);
         extra[0] = '\0';
@@ -979,17 +1081,18 @@ int main(int argc, char** argv)
         }
 
         nfm_meta meta;
+        char* st = NULL;
+        char* sa = NULL;
+        char* sl = NULL;
+        uint8_t* img = NULL;
+        size_t img_len = 0;
+        int img_type = NFM_IMG_NONE;
         if (use_nfm) {
-            char* st = NULL;
-            char* sa = NULL;
-            char* sl = NULL;
             extract_media_meta(argv[2], &st, &sa, &sl);
             meta.title = nfm_title ? nfm_title : st;
             meta.artist = nfm_artist ? nfm_artist : sa;
             meta.album = nfm_album ? nfm_album : sl;
-            free(st);
-            free(sa);
-            free(sl);
+            extract_media_img(argv[2], &img, &img_len, &img_type);
         } else {
             meta.title = nfm_title;
             meta.artist = nfm_artist;
@@ -1000,7 +1103,11 @@ int main(int argc, char** argv)
                          policy, frame_len, degree, cf, fit,
                          step, have_baskets, baskets, e5, err5,
                          is_nfa5 && have_rate, rate,
-                         use_nfm, &meta);
+                         use_nfm, &meta, img, img_len, img_type);
+        free(st);
+        free(sa);
+        free(sl);
+        free(img);
         if (e != ERR_OK) {
             fprintf(stderr, "%s: %s\n", argv[3], g_err_str(e));
             pcm_free(&pcm);
@@ -1244,11 +1351,15 @@ int main(int argc, char** argv)
             char* est = NULL;
             char* esa = NULL;
             char* esl = NULL;
+            uint8_t* img = NULL;
+            size_t img_len = 0;
+            int img_type = NFM_IMG_NONE;
             if (use_nfm) {
                 extract_media_meta(argv[2], &est, &esa, &esl);
                 meta.title = nfm_title ? nfm_title : est;
                 meta.artist = nfm_artist ? nfm_artist : esa;
                 meta.album = nfm_album ? nfm_album : esl;
+                extract_media_img(argv[2], &img, &img_len, &img_type);
             } else {
                 meta.title = nfm_title;
                 meta.artist = nfm_artist;
@@ -1259,10 +1370,11 @@ int main(int argc, char** argv)
                                   policy, frame_len, degree, cf, fit,
                                   step, have_baskets, baskets, e5, err5,
                                   have_rate, rate,
-                                  use_nfm, &meta);
+                                  use_nfm, &meta, img, img_len, img_type);
             free(est);
             free(esa);
             free(esl);
+            free(img);
             if (e2 != ERR_OK) {
                 fprintf(stderr, "%s: %s\n", out, g_err_str(e));
                 failures++;

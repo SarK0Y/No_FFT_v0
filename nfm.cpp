@@ -1,8 +1,8 @@
 /* nfm.cpp - No_FFT Media container implementation.
  *
  * The format is a length-prefixed header: magic "nfm", a u64 header_len,
- * then header_len bytes of text fields and optional image, then the raw
- * codec payload. No marker scanning needed.
+ * then header_len bytes holding an image block (always present, possibly
+ * empty) followed by text fields, then the raw codec payload.
  */
 
 #include "nfm.h"
@@ -75,16 +75,17 @@ static int write_field(FILE* f, const char* name, const char* value)
 static uint64_t header_size(const nfm_meta* meta,
                             const uint8_t* img, size_t img_len, int img_type)
 {
-    uint64_t h = 0;
+    /* Image block is always present: img_type u8, img_len u32 (+ data). */
+    uint64_t h = 1 + 4;
+    if (img != NULL && img_len > 0 && img_type > NFM_IMG_NONE)
+        h += img_len;
+
     if (meta != NULL && meta->title != NULL)
         h += 2 + strlen("title") + 4 + strlen(meta->title);
     if (meta != NULL && meta->artist != NULL)
         h += 2 + strlen("artist") + 4 + strlen(meta->artist);
     if (meta != NULL && meta->album != NULL)
         h += 2 + strlen("album") + 4 + strlen(meta->album);
-
-    if (img != NULL && img_len > 0 && img_type > NFM_IMG_NONE)
-        h += 1 + 4 + img_len;
 
     return h;
 }
@@ -111,23 +112,18 @@ Err nfm_write(const char* path,
     put_u64(hl, hlen);
     if (ok) ok = (fwrite(hl, 1, 8, f) == 8);
 
+    /* image block (always present; img_len == 0 means no image) */
+    int have_img = (img != NULL && img_len > 0 && img_type > NFM_IMG_NONE);
+    uint8_t ih[5];
+    ih[0] = (uint8_t)(have_img ? img_type : NFM_IMG_NONE);
+    put_u32(ih + 1, (uint32_t)(have_img ? img_len : 0));
+    if (ok) ok = (fwrite(ih, 1, 5, f) == 5);
+    if (ok && have_img) ok = (fwrite(img, 1, img_len, f) == img_len);
+
     /* text fields */
     if (meta != NULL && meta->title  != NULL) { if (ok) ok = write_field(f, "title",  meta->title);  }
     if (meta != NULL && meta->artist != NULL) { if (ok) ok = write_field(f, "artist", meta->artist); }
     if (meta != NULL && meta->album  != NULL) { if (ok) ok = write_field(f, "album",  meta->album);  }
-
-    /* optional image */
-    if (ok && img != NULL && img_len > 0 && img_type > NFM_IMG_NONE) {
-        if (img_len > 0xFFFFFFFFull)
-            ok = 0;
-        else {
-            uint8_t ih[5];
-            ih[0] = (uint8_t)img_type;
-            put_u32(ih + 1, (uint32_t)img_len);
-            ok = (fwrite(ih, 1, 5, f) == 5) &&
-                 (fwrite(img, 1, img_len, f) == img_len);
-        }
-    }
 
     /* payload */
     if (ok) ok = (fwrite(payload, 1, payload_len, f) == payload_len);
@@ -205,9 +201,26 @@ Err nfm_read(const char* path,
         return ERR_BAD_INPUT;
     }
 
-    /* Parse header fields. */
+    /* Parse header: image block first, then text fields. */
     size_t pos = 3 + 8;
     size_t hend = 3 + 8 + hlen;
+
+    if (pos + 5 > hend) { free(data); return ERR_BAD_INPUT; }
+    int itype = (int)data[pos];
+    pos += 1;
+    uint32_t ilen = get_u32(data + pos);
+    pos += 4;
+    if (pos + ilen > hend) { free(data); return ERR_BAD_INPUT; }
+    if (img != NULL && ilen > 0) {
+        *img = (uint8_t*)malloc(ilen);
+        if (*img == NULL) { free(data); return ERR_NO_MEMORY; }
+        memcpy(*img, data + pos, ilen);
+        if (img_len != NULL) *img_len = ilen;
+        if (img_type != NULL) *img_type = itype;
+    }
+    pos += ilen;
+
+    /* Text fields. */
     while (pos < hend) {
         if (pos + 2 > hend) { free(data); return ERR_BAD_INPUT; }
         uint16_t name_len = get_u16(data + pos);
@@ -247,28 +260,6 @@ Err nfm_read(const char* path,
         }
 
         pos += value_len;
-    }
-
-    /* Optional image: scan header for PNG/JPEG signature. */
-    if (img != NULL) {
-        for (size_t i = 3 + 8; i + 2 <= hend; i++) {
-            if (data[i] == 0x89 && data[i+1] == 'P' && data[i+2] == 'N' && data[i+3] == 'G') {
-                *img = (uint8_t*)malloc(hend - i);
-                if (*img == NULL) { free(data); return ERR_NO_MEMORY; }
-                memcpy(*img, data + i, hend - i);
-                if (img_len != NULL) *img_len = hend - i;
-                if (img_type != NULL) *img_type = NFM_IMG_PNG;
-                break;
-            }
-            if (data[i] == 0xFF && data[i+1] == 0xD8) {
-                *img = (uint8_t*)malloc(hend - i);
-                if (*img == NULL) { free(data); return ERR_NO_MEMORY; }
-                memcpy(*img, data + i, hend - i);
-                if (img_len != NULL) *img_len = hend - i;
-                if (img_type != NULL) *img_type = NFM_IMG_JPEG;
-                break;
-            }
-        }
     }
 
     /* Payload is everything after the header. */

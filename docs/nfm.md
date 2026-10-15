@@ -14,9 +14,24 @@ PNG/JPEG image (cover). Files use extension `.nfm` and start with magic `nfm`
 +---------------------+
 ```
 
-`header_len` is the length in bytes of the header data that follows (text
-fields + optional image). The header data contains zero or more text fields,
-optionally followed by an image block.
+`header_len` is the length in bytes of the header data that follows. The header
+data always begins with an image block (possibly empty), followed by zero or
+more text fields:
+
+```text
++-------------------+
+| img_type (uint8_t)|
+| img_len  (uint32_t)|
+| img_data [img_len]|   (only when img_len > 0)
++-------------------+
+| text field 0      |
+| text field 1      |
+| ...               |
++-------------------+
+```
+
+Because the image block is always present, a reader can unambiguously tell where
+it ends and the text fields begin. `img_len == 0` means "no image".
 
 ## Text fields
 
@@ -41,10 +56,10 @@ Common keys suggested (not enforced):
   `nfa4`, `nfa5`, `nfa6`)
 - `comment`, `encoder`, `software`
 
-## Optional image
+## Image block
 
-An optional cover image may be embedded inside the header data. If present, the
-image block is encoded as:
+The image block is always the first part of the header data. When an image is
+present (`img_len > 0`) it is encoded as:
 
 ```text
 +-------------------+
@@ -55,10 +70,12 @@ image block is encoded as:
 ```
 
 `img_type` values:
+- `0` = none
 - `1` = PNG
 - `2` = JPEG
 
-The data is the raw bytes of the image file (not base64).
+The data is the raw bytes of the image file (not base64). When there is no
+image, `img_type = 0` and `img_len = 0`.
 
 ## Payload
 
@@ -70,11 +87,12 @@ decoder can detect the inner format by reading the first 4 bytes of the payload.
 
 ## Recommended behavior
 
-- Writing: emit magic `nfm`, write `header_len` (u64), write header data (text
-  fields and optional image), append the codec's encoded bytes.
-- Reading: read magic + header_len, read `header_len` bytes of header data to
-  extract metadata and optional image, treat the remainder as the inner codec
-  stream and decode with the appropriate codec.
+- Writing: emit magic `nfm`, write `header_len` (u64), write the image block
+  (always present; `img_len = 0` when none), write the text fields, then append
+  the codec's encoded bytes.
+- Reading: read magic + header_len, read the image block, then parse the text
+  fields to extract metadata, treat the remainder as the inner codec stream and
+  decode with the appropriate codec.
 - Preservation: when copying/re-encoding, copy unknown fields and image.
 - Streaming: the format is seek-forward-friendly via length prefixes.
 
@@ -90,8 +108,8 @@ output extension to `.nfm`.
 ./nofft convert input.mp3 output.nfm -algo nfa3 -bits 6 -nfm
 ```
 
-Metadata is automatically extracted from the source file when available. Override
-or add fields explicitly:
+Metadata (title, artist, album) and the cover image are automatically extracted
+from the source file when available. Override or add text fields explicitly:
 
 ```bash
 ./nofft convert input.mp3 output.nfm -algo nfa3 -bits 6 -nfm \
@@ -105,6 +123,17 @@ Flags:
 - `-nfm-title <text>` — set title (overrides extracted value)
 - `-nfm-artist <text>` — set artist (overrides extracted value)
 - `-nfm-album <text>` — set album (overrides extracted value)
+
+### Automatic cover-art copying
+
+When `-nfm` is set, the source file's attached picture (ID3 `APIC` cover in an
+MP3, or an embedded image in a WAV) is extracted with `ffmpeg` and stored in the
+NFM header as a PNG. Any image format ffmpeg can decode (e.g. JPEG/MJPEG cover
+art) is converted to PNG before embedding. Sources without cover art simply get
+an empty image block (`img_type = 0`, `img_len = 0`).
+
+Requires `ffmpeg` on `PATH`; if it is missing or the file has no cover, the NFM
+is still written without an image.
 
 With `convert-all`, each codec produces `basename.<codec>.nfm` when `-nfm` is
 set.
@@ -136,8 +165,8 @@ Err e = nfm_write("out.nfm", payload, payload_len, &meta, img, img_len, NFM_IMG_
 
 ```text
 nfm  header_len=...
-name_len=5 "title" value_len=12 "Test Track"
 img_type=1 img_len=... <png bytes>
+name_len=5 "title" value_len=12 "Test Track"
 <NFA3 or NOFF container bytes>
 ```
 

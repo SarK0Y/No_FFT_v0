@@ -10,10 +10,10 @@
  *
  * Layout:
  *   magic[3]      "nfm"
- *   header_len    u64   length of the header that follows (fields + image)
- *   header data:  text fields and optional image (header_len bytes)
- *     text fields: name_len u16, name[], value_len u32, value[]   (0+ fields)
- *     image:       img_type u8, img_len u32, img_data[]          (optional)
+ *   header_len    u64   length of the header that follows
+ *   header data:  header_len bytes:
+ *     image:      img_type u8, img_len u32, img_data[]   (img_len 0 = none)
+ *     text fields:name_len u16, name[], value_len u32, value[]   (0+ fields)
  *   payload       raw codec bytes (NOFF / NFA1..NFA6 magic)
  */
 
