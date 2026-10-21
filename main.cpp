@@ -668,25 +668,22 @@ int main(int argc, char** argv)
             return 1;
         }
 
-        e = nofft_decode(in_path, &dec);
+        /* Decode straight into the WAV: each frame is written as it is
+           unpacked instead of assembling the whole clip first. */
+        nofft_wav_sink ws;
+        nofft_wav_sink_init(&ws, argv[3]);
+        e = nofft_decode_sink(in_path, &ws.sink);
+        nofft_wav_sink_fini(&ws);
         if (e != ERR_OK) {
             fprintf(stderr, "%s: %s\n", argv[2], g_err_str(e));
-            if (in_path != argv[2]) { remove(in_path); free((void*)in_path); }
-            return 1;
-        }
-
-        e = wav_save(argv[3], &dec);
-        if (e != ERR_OK) {
-            fprintf(stderr, "%s: %s\n", argv[3], g_err_str(e));
-            pcm_free(&dec);
+            remove(argv[3]);
             if (in_path != argv[2]) { remove(in_path); free((void*)in_path); }
             return 1;
         }
 
         fprintf(stderr, "%s -> %s  %u ch  %u Hz  %zu samples\n",
-                argv[2], argv[3], dec.channels, dec.sample_rate, dec.count);
+                argv[2], argv[3], ws.channels, ws.sample_rate, ws.total);
 
-        pcm_free(&dec);
         if (in_path != argv[2]) { remove(in_path); free((void*)in_path); }
         return 0;
     }
@@ -1728,25 +1725,22 @@ int main(int argc, char** argv)
             return 1;
         }
 
-        e = acpcm_decode(in_path, &dec);
+        /* Decode straight into the WAV: chunks are written as they are
+           decoded instead of assembling the whole clip first. */
+        nofft_wav_sink ws;
+        nofft_wav_sink_init(&ws, argv[3]);
+        e = acpcm_decode_sink(in_path, &ws.sink);
+        nofft_wav_sink_fini(&ws);
         if (e != ERR_OK) {
             fprintf(stderr, "%s: %s\n", argv[2], g_err_str(e));
-            if (in_path != argv[2]) { remove(in_path); free((void*)in_path); }
-            return 1;
-        }
-
-        e = wav_save(argv[3], &dec);
-        if (e != ERR_OK) {
-            fprintf(stderr, "%s: %s\n", argv[3], g_err_str(e));
-            pcm_free(&dec);
+            remove(argv[3]);
             if (in_path != argv[2]) { remove(in_path); free((void*)in_path); }
             return 1;
         }
 
         fprintf(stderr, "%s -> %s  %u ch  %u Hz  %zu samples\n",
-                argv[2], argv[3], dec.channels, dec.sample_rate, dec.count);
+                argv[2], argv[3], ws.channels, ws.sample_rate, ws.total);
 
-        pcm_free(&dec);
         if (in_path != argv[2]) { remove(in_path); free((void*)in_path); }
         return 0;
     }
