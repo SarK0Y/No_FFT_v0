@@ -123,6 +123,7 @@ Flags:
 - `-nfm-title <text>` — set title (overrides extracted value)
 - `-nfm-artist <text>` — set artist (overrides extracted value)
 - `-nfm-album <text>` — set album (overrides extracted value)
+- `-snr` — decode the written `.nfm` back and print its SNR against the source
 
 ### Automatic cover-art copying
 

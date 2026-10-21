@@ -40,6 +40,7 @@ static void usage(const char* argv0)
         "               [-set-e X] [-set-err X | -set-rate X]             (nfa5)\n"
         "               [-block N] [-set-e X] [-set-rate X]               (nfa6)\n"
         "               [-nfm] [-nfm-title ...] [-nfm-artist ...] [-nfm-album ...]\n"
+        "               [-snr]   print the SNR of the decoded output vs the source\n"
         "  %s convert-all <in.mp3> <out-prefix>\n"
         "               [frame_len] [degree] [f32|f16] [interp|least-sq]\n"
         "               [-bits N] [-block N] [-policy ...] [-s N | -b N]\n"
@@ -76,7 +77,9 @@ static void usage(const char* argv0)
         "    -set-rate X    target bits/sample: NFA5 auto-dials its err to hit\n"
         "                   it, NFA6 meets it per block (default 2.6)\n"
         "    -algo name     convert codec: poly (default), nfa1, nfa2, nfa3, nfa4, nfa5, nfa6\n"
-        "    -bits N        acpcm quantiser width for convert/convert-all (default 6)\n",
+        "    -bits N        acpcm quantiser width for convert/convert-all (default 6)\n"
+        "    -snr           convert: decode the written output and print its SNR vs\n"
+        "                   the source audio (handles .nfm, .nadc and .no_fft)\n",
         argv0, argv0, argv0, argv0, argv0, argv0,
         argv0, argv0, argv0, argv0, argv0, argv0, argv0, argv0);
 }
@@ -818,6 +821,7 @@ int main(int argc, char** argv)
         const char* pos[4] = { NULL, NULL, NULL, NULL };
         int npos = 0;
         bool use_nfm = false;
+        bool show_snr = false;
         const char* nfm_title = NULL;
         const char* nfm_artist = NULL;
         const char* nfm_album = NULL;
@@ -830,6 +834,10 @@ int main(int argc, char** argv)
                     return 2;
                 }
                 algo = argv[++i];
+                continue;
+            }
+            if (strcmp(argv[i], "-snr") == 0) {
+                show_snr = true;
                 continue;
             }
             if (strcmp(argv[i], "-set-e") == 0) {
@@ -1114,6 +1122,28 @@ int main(int argc, char** argv)
             remove(tmp);
             free(tmp);
             return 1;
+        }
+
+        if (show_snr) {
+            /* Decode the just-written output and compare against the source.
+               The output may be NFM-wrapped, so unwrap it first (returns the
+               original path for .nadc/.no_fft, or a temp payload to free). */
+            Err ue = ERR_OK;
+            const char* out_path = nfm_unwrap(argv[3], &ue);
+            if (out_path != NULL) {
+                pcm_buf decb;
+                memset(&decb, 0, sizeof(decb));
+                Err de = is_poly ? nofft_decode(out_path, &decb)
+                                 : acpcm_decode(out_path, &decb);
+                if (de == ERR_OK && decb.count == pcm.count)
+                    fprintf(stderr, "SNR: %.2f dB\n",
+                            compute_snr(pcm.samples, decb.samples, pcm.count));
+                pcm_free(&decb);
+                if (out_path != argv[3]) {
+                    remove(out_path);
+                    free((void*)out_path);
+                }
+            }
         }
 
         pcm_free(&pcm);
