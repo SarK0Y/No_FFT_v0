@@ -1,11 +1,14 @@
 #include "nofft.h"
 #include "acpcm.h"
 #include "selftest.h"
+#include "nfm.h"
+#include "codec.h"
 
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <fcntl.h>
 #include <errno.h>
 #include <sys/wait.h>
 #include <sys/stat.h>
@@ -36,10 +39,13 @@ static void usage(const char* argv0)
         "               [-bits N] [-block N] [-policy ...] [-s N | -b N]   (nfa*)\n"
         "               [-set-e X] [-set-err X | -set-rate X]             (nfa5)\n"
         "               [-block N] [-set-e X] [-set-rate X]               (nfa6)\n"
+        "               [-nfm] [-nfm-title ...] [-nfm-artist ...] [-nfm-album ...]\n"
+        "               [-snr]   print the SNR of the decoded output vs the source\n"
         "  %s convert-all <in.mp3> <out-prefix>\n"
         "               [frame_len] [degree] [f32|f16] [interp|least-sq]\n"
         "               [-bits N] [-block N] [-policy ...] [-s N | -b N]\n"
         "               [-set-e X] [-set-err X | -set-rate X]\n"
+        "               [-nfm] [-nfm-title ...] [-nfm-artist ...] [-nfm-album ...]\n"
         "  %s play <in.no_fft>                 (WAV to stdout, for piping)\n"
         "\n"
         "acpcm, sample-domain DPCM with a range coder (no polynomial):\n"
@@ -71,7 +77,9 @@ static void usage(const char* argv0)
         "    -set-rate X    target bits/sample: NFA5 auto-dials its err to hit\n"
         "                   it, NFA6 meets it per block (default 2.6)\n"
         "    -algo name     convert codec: poly (default), nfa1, nfa2, nfa3, nfa4, nfa5, nfa6\n"
-        "    -bits N        acpcm quantiser width for convert/convert-all (default 6)\n",
+        "    -bits N        acpcm quantiser width for convert/convert-all (default 6)\n"
+        "    -snr           convert: decode the written output and print its SNR vs\n"
+        "                   the source audio (handles .nfm, .nadc and .no_fft)\n",
         argv0, argv0, argv0, argv0, argv0, argv0,
         argv0, argv0, argv0, argv0, argv0, argv0, argv0, argv0);
 }
@@ -193,6 +201,196 @@ static int run_ffmpeg(const char* src, const char* dst)
     return 0;
 }
 
+/* Duplicates a string without relying on POSIX strdup, so the build does not
+   depend on _POSIX_C_SOURCE being set. */
+static char* dup_str(const char* s)
+{
+    if (s == NULL)
+        return NULL;
+    size_t n = strlen(s) + 1;
+    char* p = (char*)malloc(n);
+    if (p == NULL)
+        return NULL;
+    memcpy(p, s, n);
+    return p;
+}
+
+/* Extract metadata (title, artist, album) from a media file via ffmpeg.
+   Returns 0 on success.  Any of title/artist/album may be NULL to skip. */
+static int extract_media_meta(const char* path, char** title, char** artist, char** album)
+{
+    if (title != NULL) *title = NULL;
+    if (artist != NULL) *artist = NULL;
+    if (album != NULL) *album = NULL;
+
+    /* Capture ffmpeg's stderr (which carries the metadata) into a temp file. */
+    char tmp_template[] = "/tmp/nofft_meta_XXXXXX";
+    int tmp_fd = mkstemp(tmp_template);
+    if (tmp_fd < 0)
+        return -1;
+
+    const char* argv[10];
+    pid_t pid;
+
+    argv[0] = "ffmpeg";
+    argv[1] = "-nostdin";
+    argv[2] = "-hide_banner";
+    argv[3] = "-i";
+    argv[4] = path;
+    argv[5] = "-f";
+    argv[6] = "null";
+    argv[7] = "-";
+    argv[8] = NULL;
+    argv[9] = NULL;
+
+    pid = fork();
+    if (pid < 0) {
+        close(tmp_fd);
+        remove(tmp_template);
+        return -1;
+    }
+
+    if (pid == 0) {
+        dup2(tmp_fd, 2);   /* stderr -> temp file */
+        close(tmp_fd);
+        execvp(argv[0], (char* const*)argv);
+        _exit(127);
+    }
+
+    close(tmp_fd);
+
+    int status = 0;
+    waitpid(pid, &status, 0);
+
+    FILE* fp = fopen(tmp_template, "r");
+    if (fp == NULL) {
+        remove(tmp_template);
+        return -1;
+    }
+
+    char line[1024];
+    while (fgets(line, sizeof(line), fp) != NULL) {
+        /* skip leading whitespace */
+        char* p = line;
+        while (*p == ' ' || *p == '\t') p++;
+
+        /* ffmpeg emits lowercase keys like "title", "artist", "album" */
+        char** slot = NULL;
+        if (strncmp(p, "title", 5) == 0 && title != NULL && *title == NULL)
+            slot = title;
+        else if (strncmp(p, "artist", 6) == 0 && artist != NULL && *artist == NULL)
+            slot = artist;
+        else if (strncmp(p, "album", 5) == 0 && album != NULL && *album == NULL)
+            slot = album;
+
+        if (slot != NULL) {
+            char* colon = strchr(p, ':');
+            if (colon) {
+                char* v = colon + 1;
+                while (*v == ' ') v++;
+                /* trim trailing whitespace / CR */
+                char* end = v + strlen(v);
+                while (end > v && (end[-1] == ' ' || end[-1] == '\r' || end[-1] == '\n' || end[-1] == '\t'))
+                    end--;
+                *end = '\0';
+                *slot = dup_str(v);
+            }
+        }
+    }
+
+    fclose(fp);
+    remove(tmp_template);
+    return 0;
+}
+
+/* Extract embedded cover art from a media file via ffmpeg.  On success, returns
+   0 and sets img, img_len (caller frees with free()) and img_type to NFM_IMG_PNG.
+   Returns -1 if no image is found or on error. */
+static int extract_media_img(const char* path, uint8_t** img, size_t* img_len,
+                             int* img_type)
+{
+    *img = NULL;
+    *img_len = 0;
+    *img_type = NFM_IMG_NONE;
+
+    char tmp_template[] = "/tmp/nofft_img_XXXXXX.png";
+    int tmp_fd = mkstemps(tmp_template, 4);
+    if (tmp_fd < 0)
+        return -1;
+    close(tmp_fd);
+
+    const char* argv[10];
+    pid_t pid;
+
+    argv[0] = "ffmpeg";
+    argv[1] = "-nostdin";
+    argv[2] = "-hide_banner";
+    argv[3] = "-loglevel";
+    argv[4] = "error";
+    argv[5] = "-y";
+    argv[6] = "-i";
+    argv[7] = path;
+    argv[8] = tmp_template;
+    argv[9] = NULL;
+
+    pid = fork();
+    if (pid < 0) {
+        remove(tmp_template);
+        return -1;
+    }
+
+    if (pid == 0) {
+        /* Audio-only sources make ffmpeg print a harmless "no stream" error;
+           silence it since there is nothing for us to read. */
+        int devnull = open("/dev/null", O_WRONLY);
+        if (devnull >= 0) {
+            dup2(devnull, 2);
+            close(devnull);
+        }
+        execvp(argv[0], (char* const*)argv);
+        _exit(127);
+    }
+
+    int status = 0;
+    waitpid(pid, &status, 0);
+
+    if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) {
+        remove(tmp_template);
+        return -1;
+    }
+
+    FILE* f = fopen(tmp_template, "rb");
+    if (f == NULL) {
+        remove(tmp_template);
+        return -1;
+    }
+    fseek(f, 0, SEEK_END);
+    long sz = ftell(f);
+    fseek(f, 0, SEEK_SET);
+    if (sz <= 0) {
+        fclose(f);
+        remove(tmp_template);
+        return -1;
+    }
+    uint8_t* buf = (uint8_t*)malloc((size_t)sz);
+    if (buf == NULL) {
+        fclose(f);
+        remove(tmp_template);
+        return -1;
+    }
+    size_t got = fread(buf, 1, (size_t)sz, f);
+    fclose(f);
+    remove(tmp_template);
+    if (got != (size_t)sz) {
+        free(buf);
+        return -1;
+    }
+    *img = buf;
+    *img_len = (size_t)sz;
+    *img_type = NFM_IMG_PNG;
+    return 0;
+}
+
 /* scratch wav path for roundtrip/convert, removed by the caller */
 static char* temp_wav_path(void)
 {
@@ -218,9 +416,73 @@ static char* temp_wav_path(void)
     return p;
 }
 
+/* If `path` is an NFM container, extract the inner codec payload to a temporary
+   file and return its path (caller must remove/free).  Otherwise returns the
+   original path.  On error returns NULL and sets *err. */
+static const char* nfm_unwrap(const char* path, Err* err)
+{
+    *err = ERR_OK;
+
+    FILE* f = fopen(path, "rb");
+    if (f == NULL) {
+        *err = ERR_OPEN;
+        return NULL;
+    }
+    uint8_t magic[3];
+    size_t got = fread(magic, 1, 3, f);
+    fclose(f);
+    if (got != 3 || !nfm_is_nfm(magic, 3))
+        return path;  /* not NFM, use as-is */
+
+    uint8_t* payload = NULL;
+    size_t payload_len = 0;
+    *err = nfm_read(path, &payload, &payload_len, NULL, NULL, NULL, NULL);
+    if (*err != ERR_OK)
+        return NULL;
+
+    char* tmp = temp_wav_path();
+    if (tmp == NULL) {
+        nfm_buf_free(payload);
+        *err = ERR_NO_MEMORY;
+        return NULL;
+    }
+    /* write payload with .nadc or .no_fft suffix so decoders can detect format */
+    const char* suffix = (payload_len >= 4 && memcmp(payload, "NOFF", 4) == 0)
+                             ? ".no_fft" : ".nadc";
+    size_t n = strlen(tmp) + strlen(suffix) + 1;
+    char* out = (char*)malloc(n);
+    if (out == NULL) {
+        nfm_buf_free(payload);
+        free(tmp);
+        *err = ERR_NO_MEMORY;
+        return NULL;
+    }
+    snprintf(out, n, "%s%s", tmp, suffix);
+    free(tmp);
+
+    FILE* of = fopen(out, "wb");
+    if (of == NULL) {
+        nfm_buf_free(payload);
+        free(out);
+        *err = ERR_OPEN;
+        return NULL;
+    }
+    int ok = (fwrite(payload, 1, payload_len, of) == payload_len);
+    fclose(of);
+    nfm_buf_free(payload);
+    if (!ok) {
+        free(out);
+        *err = ERR_IO;
+        return NULL;
+    }
+    return out;
+}
+
 /* Encode one destination with the named algorithm and print the same one-line
    summary that `convert` prints.  Returns ERR_OK, or the codec error to report.
-   Shared by `convert` (one algo) and `convert-all` (every algo). */
+   Shared by `convert` (one algo) and `convert-all` (every algo).
+   When use_nfm is set the output is wrapped in an NFM container with the given
+   metadata (any field may be NULL). */
 static Err convert_emit(const char* algo, const char* in, const char* out,
                         const pcm_buf* pcm, uint32_t cbits,
                         uint32_t block_len, acpcm_p2_policy policy,
@@ -229,30 +491,69 @@ static Err convert_emit(const char* algo, const char* in, const char* out,
                         uint32_t step,
                         bool have_baskets, uint32_t baskets,
                         double e5, double err5,
-                        bool v5a, double rate)
+                        bool v5a, double rate,
+                        bool use_nfm, const nfm_meta* meta,
+                        const uint8_t* img, size_t img_len, int img_type)
 {
     Err e = ERR_OK;
+    uint8_t* buf = NULL;
+    size_t buf_len = 0;
+    size_t enc_len = 0;
 
-    if (strcmp(algo, "poly") == 0) {
-        e = nofft_encode(out, pcm, frame_len, (uint16_t)degree, cf, fit);
-    } else if (strcmp(algo, "nfa1") == 0) {
-        e = acpcm_encode(out, pcm, (uint16_t)cbits);
-    } else if (strcmp(algo, "nfa2") == 0) {
-        e = acpcm_encode2(out, pcm, (uint16_t)cbits, block_len, policy);
-    } else if (strcmp(algo, "nfa3") == 0) {
-        e = acpcm_encode3(out, pcm, (uint16_t)cbits);
-    } else if (strcmp(algo, "nfa6") == 0) {
-        e = acpcm_encode6(out, pcm, (uint16_t)cbits, block_len, e5, rate);
-    } else if (strcmp(algo, "nfa5") == 0) {
-        e = v5a ? acpcm_encode5_auto(out, pcm, (uint16_t)cbits, e5, rate)
-                : acpcm_encode5(out, pcm, (uint16_t)cbits, e5, err5);
+    if (use_nfm) {
+        /* Encode to a buffer, then wrap in NFM. */
+        if (strcmp(algo, "poly") == 0) {
+            e = nofft_encode_buf(&buf, &buf_len, pcm, frame_len, (uint16_t)degree, cf, fit);
+        } else if (strcmp(algo, "nfa1") == 0) {
+            e = acpcm_encode_buf(&buf, &buf_len, pcm, (uint16_t)cbits);
+        } else if (strcmp(algo, "nfa2") == 0) {
+            e = acpcm_encode2_buf(&buf, &buf_len, pcm, (uint16_t)cbits, block_len, policy);
+        } else if (strcmp(algo, "nfa3") == 0) {
+            e = acpcm_encode3_buf(&buf, &buf_len, pcm, (uint16_t)cbits);
+        } else if (strcmp(algo, "nfa6") == 0) {
+            e = acpcm_encode6_buf(&buf, &buf_len, pcm, (uint16_t)cbits, block_len, e5, rate);
+        } else if (strcmp(algo, "nfa5") == 0) {
+            e = v5a ? acpcm_encode5_auto_buf(&buf, &buf_len, pcm, (uint16_t)cbits, e5, rate)
+                    : acpcm_encode5_buf(&buf, &buf_len, pcm, (uint16_t)cbits, e5, err5);
+        } else {
+            e = have_baskets
+                    ? acpcm_encode4_baskets_buf(&buf, &buf_len, pcm, (uint16_t)cbits, baskets)
+                    : acpcm_encode4_buf(&buf, &buf_len, pcm, (uint16_t)cbits, step);
+        }
+        if (e != ERR_OK)
+            return e;
+
+        nfm_meta m;
+        m.title = (meta != NULL) ? meta->title : NULL;
+        m.artist = (meta != NULL) ? meta->artist : NULL;
+        m.album = (meta != NULL) ? meta->album : NULL;
+        enc_len = buf_len;
+        e = nfm_write(out, buf, buf_len, &m, img, img_len, img_type);
+        nofft_buf_free(buf);
+        if (e != ERR_OK)
+            return e;
     } else {
-        e = have_baskets
-                ? acpcm_encode4_baskets(out, pcm, (uint16_t)cbits, baskets)
-                : acpcm_encode4(out, pcm, (uint16_t)cbits, step);
+        if (strcmp(algo, "poly") == 0) {
+            e = nofft_encode(out, pcm, frame_len, (uint16_t)degree, cf, fit);
+        } else if (strcmp(algo, "nfa1") == 0) {
+            e = acpcm_encode(out, pcm, (uint16_t)cbits);
+        } else if (strcmp(algo, "nfa2") == 0) {
+            e = acpcm_encode2(out, pcm, (uint16_t)cbits, block_len, policy);
+        } else if (strcmp(algo, "nfa3") == 0) {
+            e = acpcm_encode3(out, pcm, (uint16_t)cbits);
+        } else if (strcmp(algo, "nfa6") == 0) {
+            e = acpcm_encode6(out, pcm, (uint16_t)cbits, block_len, e5, rate);
+        } else if (strcmp(algo, "nfa5") == 0) {
+            e = v5a ? acpcm_encode5_auto(out, pcm, (uint16_t)cbits, e5, rate)
+                    : acpcm_encode5(out, pcm, (uint16_t)cbits, e5, err5);
+        } else {
+            e = have_baskets
+                    ? acpcm_encode4_baskets(out, pcm, (uint16_t)cbits, baskets)
+                    : acpcm_encode4(out, pcm, (uint16_t)cbits, step);
+        }
+        if (e != ERR_OK)
+            return e;
     }
-    if (e != ERR_OK)
-        return e;
 
     if (strcmp(algo, "poly") == 0) {
         fprintf(stderr,
@@ -266,7 +567,14 @@ static Err convert_emit(const char* algo, const char* in, const char* out,
         char extra[64];
 
         memset(&info, 0, sizeof(info));
-        if (acpcm_file_info(out, &info) == ERR_OK && info.frames != 0)
+        if (use_nfm) {
+            info.payload = enc_len;
+            info.frames = (uint32_t)(pcm->count / (pcm->channels ? pcm->channels : 1));
+            info.channels = pcm->channels;
+        } else if (acpcm_file_info(out, &info) == ERR_OK) {
+            /* info filled in by the parser */
+        }
+        if (info.frames != 0)
             bps = 8.0 * (double)info.payload /
                   ((double)info.frames * (double)info.channels);
         extra[0] = '\0';
@@ -354,23 +662,29 @@ int main(int argc, char** argv)
             return 2;
         }
 
-        e = nofft_decode(argv[2], &dec);
-        if (e != ERR_OK) {
+        const char* in_path = nfm_unwrap(argv[2], &e);
+        if (in_path == NULL) {
             fprintf(stderr, "%s: %s\n", argv[2], g_err_str(e));
             return 1;
         }
 
-        e = wav_save(argv[3], &dec);
+        /* Decode straight into the WAV: each frame is written as it is
+           unpacked instead of assembling the whole clip first. */
+        nofft_wav_sink ws;
+        nofft_wav_sink_init(&ws, argv[3]);
+        e = nofft_decode_sink(in_path, &ws.sink);
+        nofft_wav_sink_fini(&ws);
         if (e != ERR_OK) {
-            fprintf(stderr, "%s: %s\n", argv[3], g_err_str(e));
-            pcm_free(&dec);
+            fprintf(stderr, "%s: %s\n", argv[2], g_err_str(e));
+            remove(argv[3]);
+            if (in_path != argv[2]) { remove(in_path); free((void*)in_path); }
             return 1;
         }
 
         fprintf(stderr, "%s -> %s  %u ch  %u Hz  %zu samples\n",
-                argv[2], argv[3], dec.channels, dec.sample_rate, dec.count);
+                argv[2], argv[3], ws.channels, ws.sample_rate, ws.total);
 
-        pcm_free(&dec);
+        if (in_path != argv[2]) { remove(in_path); free((void*)in_path); }
         return 0;
     }
 
@@ -380,9 +694,16 @@ int main(int argc, char** argv)
             return 2;
         }
 
-        e = nofft_decode(argv[2], &dec);
+        const char* in_path = nfm_unwrap(argv[2], &e);
+        if (in_path == NULL) {
+            fprintf(stderr, "%s: %s\n", argv[2], g_err_str(e));
+            return 1;
+        }
+
+        e = nofft_decode(in_path, &dec);
         if (e != ERR_OK) {
             fprintf(stderr, "%s: %s\n", argv[2], g_err_str(e));
+            if (in_path != argv[2]) { remove(in_path); free((void*)in_path); }
             return 1;
         }
 
@@ -390,10 +711,12 @@ int main(int argc, char** argv)
         if (e != ERR_OK) {
             fprintf(stderr, "%s: %s\n", argv[2], g_err_str(e));
             pcm_free(&dec);
+            if (in_path != argv[2]) { remove(in_path); free((void*)in_path); }
             return 1;
         }
 
         pcm_free(&dec);
+        if (in_path != argv[2]) { remove(in_path); free((void*)in_path); }
         return 0;
     }
 
@@ -494,6 +817,11 @@ int main(int argc, char** argv)
         double rate = ACPCM6_RATE_DEFAULT;
         const char* pos[4] = { NULL, NULL, NULL, NULL };
         int npos = 0;
+        bool use_nfm = false;
+        bool show_snr = false;
+        const char* nfm_title = NULL;
+        const char* nfm_artist = NULL;
+        const char* nfm_album = NULL;
 
         for (int i = 4; i < argc; i++) {
             if (strcmp(argv[i], "-algo") == 0) {
@@ -503,6 +831,10 @@ int main(int argc, char** argv)
                     return 2;
                 }
                 algo = argv[++i];
+                continue;
+            }
+            if (strcmp(argv[i], "-snr") == 0) {
+                show_snr = true;
                 continue;
             }
             if (strcmp(argv[i], "-set-e") == 0) {
@@ -591,6 +923,34 @@ int main(int argc, char** argv)
                     return 2;
                 }
                 have_baskets = true;
+                continue;
+            }
+            if (strcmp(argv[i], "-nfm") == 0) {
+                use_nfm = true;
+                continue;
+            }
+            if (strcmp(argv[i], "-nfm-title") == 0) {
+                if (i + 1 >= argc) {
+                    fprintf(stderr, "-nfm-title needs a string\n");
+                    return 2;
+                }
+                nfm_title = argv[++i];
+                continue;
+            }
+            if (strcmp(argv[i], "-nfm-artist") == 0) {
+                if (i + 1 >= argc) {
+                    fprintf(stderr, "-nfm-artist needs a string\n");
+                    return 2;
+                }
+                nfm_artist = argv[++i];
+                continue;
+            }
+            if (strcmp(argv[i], "-nfm-album") == 0) {
+                if (i + 1 >= argc) {
+                    fprintf(stderr, "-nfm-album needs a string\n");
+                    return 2;
+                }
+                nfm_album = argv[++i];
                 continue;
             }
             if (argv[i][0] == '-') {
@@ -725,16 +1085,62 @@ int main(int argc, char** argv)
             return 1;
         }
 
+        nfm_meta meta;
+        char* st = NULL;
+        char* sa = NULL;
+        char* sl = NULL;
+        uint8_t* img = NULL;
+        size_t img_len = 0;
+        int img_type = NFM_IMG_NONE;
+        if (use_nfm) {
+            extract_media_meta(argv[2], &st, &sa, &sl);
+            meta.title = nfm_title ? nfm_title : st;
+            meta.artist = nfm_artist ? nfm_artist : sa;
+            meta.album = nfm_album ? nfm_album : sl;
+            extract_media_img(argv[2], &img, &img_len, &img_type);
+        } else {
+            meta.title = nfm_title;
+            meta.artist = nfm_artist;
+            meta.album = nfm_album;
+        }
+
         e = convert_emit(algo, argv[2], argv[3], &pcm, cbits, block_len,
                          policy, frame_len, degree, cf, fit,
                          step, have_baskets, baskets, e5, err5,
-                         is_nfa5 && have_rate, rate);
+                         is_nfa5 && have_rate, rate,
+                         use_nfm, &meta, img, img_len, img_type);
+        free(st);
+        free(sa);
+        free(sl);
+        free(img);
         if (e != ERR_OK) {
             fprintf(stderr, "%s: %s\n", argv[3], g_err_str(e));
             pcm_free(&pcm);
             remove(tmp);
             free(tmp);
             return 1;
+        }
+
+        if (show_snr) {
+            /* Decode the just-written output and compare against the source.
+               The output may be NFM-wrapped, so unwrap it first (returns the
+               original path for .nadc/.no_fft, or a temp payload to free). */
+            Err ue = ERR_OK;
+            const char* out_path = nfm_unwrap(argv[3], &ue);
+            if (out_path != NULL) {
+                pcm_buf decb;
+                memset(&decb, 0, sizeof(decb));
+                Err de = is_poly ? nofft_decode(out_path, &decb)
+                                 : acpcm_decode(out_path, &decb);
+                if (de == ERR_OK && decb.count == pcm.count)
+                    fprintf(stderr, "SNR: %.2f dB\n",
+                            compute_snr(pcm.samples, decb.samples, pcm.count));
+                pcm_free(&decb);
+                if (out_path != argv[3]) {
+                    remove(out_path);
+                    free((void*)out_path);
+                }
+            }
         }
 
         pcm_free(&pcm);
@@ -763,6 +1169,10 @@ int main(int argc, char** argv)
         int npos = 0;
         int failures = 0;
         uint64_t total_bytes = 0;
+        bool use_nfm = false;
+        const char* nfm_title = NULL;
+        const char* nfm_artist = NULL;
+        const char* nfm_album = NULL;
 
         if (argc < 4) {
             usage(argv[0]);
@@ -855,6 +1265,34 @@ int main(int argc, char** argv)
                 have_baskets = true;
                 continue;
             }
+            if (strcmp(argv[i], "-nfm") == 0) {
+                use_nfm = true;
+                continue;
+            }
+            if (strcmp(argv[i], "-nfm-title") == 0) {
+                if (i + 1 >= argc) {
+                    fprintf(stderr, "-nfm-title needs a string\n");
+                    return 2;
+                }
+                nfm_title = argv[++i];
+                continue;
+            }
+            if (strcmp(argv[i], "-nfm-artist") == 0) {
+                if (i + 1 >= argc) {
+                    fprintf(stderr, "-nfm-artist needs a string\n");
+                    return 2;
+                }
+                nfm_artist = argv[++i];
+                continue;
+            }
+            if (strcmp(argv[i], "-nfm-album") == 0) {
+                if (i + 1 >= argc) {
+                    fprintf(stderr, "-nfm-album needs a string\n");
+                    return 2;
+                }
+                nfm_album = argv[++i];
+                continue;
+            }
             if (argv[i][0] == '-') {
                 fprintf(stderr, "unknown flag: %s\n", argv[i]);
                 return 2;
@@ -924,8 +1362,8 @@ int main(int argc, char** argv)
         for (size_t k = 0; k < n_algos; k++) {
             char out[4096];
             struct stat st;
-            const char* ext = strcmp(algos[k], "poly") == 0 ? "no_fft"
-                                                            : "nadc";
+            const char* ext = use_nfm ? "nfm"
+                         : (strcmp(algos[k], "poly") == 0 ? "no_fft" : "nadc");
             int n = snprintf(out, sizeof(out), "%s.%s.%s",
                              argv[3], algos[k], ext);
 
@@ -936,11 +1374,35 @@ int main(int argc, char** argv)
                 continue;
             }
 
-            e = convert_emit(algos[k], argv[2], out, &pcm, cbits, block_len,
-                             policy, frame_len, degree, cf, fit,
-                             step, have_baskets, baskets, e5, err5,
-                             have_rate, rate);
-            if (e != ERR_OK) {
+            nfm_meta meta;
+            char* est = NULL;
+            char* esa = NULL;
+            char* esl = NULL;
+            uint8_t* img = NULL;
+            size_t img_len = 0;
+            int img_type = NFM_IMG_NONE;
+            if (use_nfm) {
+                extract_media_meta(argv[2], &est, &esa, &esl);
+                meta.title = nfm_title ? nfm_title : est;
+                meta.artist = nfm_artist ? nfm_artist : esa;
+                meta.album = nfm_album ? nfm_album : esl;
+                extract_media_img(argv[2], &img, &img_len, &img_type);
+            } else {
+                meta.title = nfm_title;
+                meta.artist = nfm_artist;
+                meta.album = nfm_album;
+            }
+
+            Err e2 = convert_emit(algos[k], argv[2], out, &pcm, cbits, block_len,
+                                  policy, frame_len, degree, cf, fit,
+                                  step, have_baskets, baskets, e5, err5,
+                                  have_rate, rate,
+                                  use_nfm, &meta, img, img_len, img_type);
+            free(est);
+            free(esa);
+            free(esl);
+            free(img);
+            if (e2 != ERR_OK) {
                 fprintf(stderr, "%s: %s\n", out, g_err_str(e));
                 failures++;
                 continue;
@@ -1257,23 +1719,29 @@ int main(int argc, char** argv)
             return 2;
         }
 
-        e = acpcm_decode(argv[2], &dec);
-        if (e != ERR_OK) {
+        const char* in_path = nfm_unwrap(argv[2], &e);
+        if (in_path == NULL) {
             fprintf(stderr, "%s: %s\n", argv[2], g_err_str(e));
             return 1;
         }
 
-        e = wav_save(argv[3], &dec);
+        /* Decode straight into the WAV: chunks are written as they are
+           decoded instead of assembling the whole clip first. */
+        nofft_wav_sink ws;
+        nofft_wav_sink_init(&ws, argv[3]);
+        e = acpcm_decode_sink(in_path, &ws.sink);
+        nofft_wav_sink_fini(&ws);
         if (e != ERR_OK) {
-            fprintf(stderr, "%s: %s\n", argv[3], g_err_str(e));
-            pcm_free(&dec);
+            fprintf(stderr, "%s: %s\n", argv[2], g_err_str(e));
+            remove(argv[3]);
+            if (in_path != argv[2]) { remove(in_path); free((void*)in_path); }
             return 1;
         }
 
         fprintf(stderr, "%s -> %s  %u ch  %u Hz  %zu samples\n",
-                argv[2], argv[3], dec.channels, dec.sample_rate, dec.count);
+                argv[2], argv[3], ws.channels, ws.sample_rate, ws.total);
 
-        pcm_free(&dec);
+        if (in_path != argv[2]) { remove(in_path); free((void*)in_path); }
         return 0;
     }
 
@@ -1298,9 +1766,16 @@ int main(int argc, char** argv)
             return 2;
         }
 
-        e = acpcm_decode(argv[2], &dec);
+        const char* in_path = nfm_unwrap(argv[2], &e);
+        if (in_path == NULL) {
+            fprintf(stderr, "%s: %s\n", argv[2], g_err_str(e));
+            return 1;
+        }
+
+        e = acpcm_decode(in_path, &dec);
         if (e != ERR_OK) {
             fprintf(stderr, "%s: %s\n", argv[2], g_err_str(e));
+            if (in_path != argv[2]) { remove(in_path); free((void*)in_path); }
             return 1;
         }
 
@@ -1308,10 +1783,12 @@ int main(int argc, char** argv)
         if (e != ERR_OK) {
             fprintf(stderr, "%s: %s\n", argv[2], g_err_str(e));
             pcm_free(&dec);
+            if (in_path != argv[2]) { remove(in_path); free((void*)in_path); }
             return 1;
         }
 
         pcm_free(&dec);
+        if (in_path != argv[2]) { remove(in_path); free((void*)in_path); }
         return 0;
     }
 

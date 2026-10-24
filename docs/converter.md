@@ -105,6 +105,7 @@ nofft convert-all song.mp3 out 32 5 f16 least-sq -block 512 -policy always
 | Flag | Applies to | Meaning |
 | --- | --- | --- |
 | `-algo name` | `convert` | `poly` (default), `nfa1`, `nfa2`, `nfa3`, `nfa4`, `nfa5` or `nfa6` |
+| `-snr` | `convert` | after writing, decode the output back and print its SNR in dB against the source; works for `.nfm`, `.nadc` and `.no_fft` |
 | `-bits N` | `nfa*` | quantiser width, 2..24 (default 6) |
 | `-block N` | `nfa2`, `nfa6` | block window in frames, >= 1 (default 1024) |
 | `-policy p` | `nfa2` | `never`, `always` or `drift` (default `drift`) |
